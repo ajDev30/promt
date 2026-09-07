@@ -1,0 +1,2419 @@
+in my instructional reader this is .js of the code
+
+
+window.InstructionalReader = (function() {
+    let pc = null;
+    let dataChannel = null;
+    let microphoneStream = null;
+    let speechRecognition = null;
+    let isRecording = false;
+    let isIntervening = false;
+    let isAudioPlaying = false; // Anti-exploit flag: drop all audio deltas during playback
+    let interventionTimer = null;
+    let activeEngineName = "Connecting...";
+
+    // Word Isolation & Progressive Blending & Mastery State
+    let isIsolatedMode = false;
+    let isolatedTargetWord = "";
+    let isolatedRespelling = "";
+    let isolatedIpa = "";
+    let isolatedSyllables = [];
+    let isolatedBlendingSteps = [];
+    let activeSyllableIndex = 0;
+    let syllableStatus = []; // 'pending', 'focus', 'good', 'miscue'
+    let wordMasteryCount = 0;
+    let wordMasteryTarget = 2; // Dynamic teacher-configured target (1x, 2x, 3x, 4x, 5x)
+    let coachingAttemptNumber = 1; // 3-stage blending correction tracker
+
+    // Reading Speed & Timer State
+    let readingStartTime = null;
+    let totalReadingTimeSeconds = 0;
+    let calculatedReadingSpeedWPM = 0;
+
+    // Single Audio Manager State to prevent concurrent audio overlap
+    let currentPlayingAudio = null;
+    let audioCooldownTimer = null;
+
+    let lines = [];
+    let passageWordRecords = []; // Tracks every word's exact status: { word, line, index, status, spoken }
+    let currentLineIndex = 0;
+    let currentWordIndex = 0;
+    let miscueCount = 0;
+    let wordAudioMap = {}; // word -> data:audio/mp3;base64,...
+
+    let liveTranscript = "";
+    let finalTranscript = "";
+
+    const ASR_SERVICE_URL = "http://localhost:8000";
+
+    // Dynamic alias maps populated automatically from Python NLP & OpenAI breakdown
+    let WHOLE_WORD_ALIASES = {
+        "miso": ["miso", "meeso", "meso", "me so", "mi so", "mee soh", "meesoh", "my so"],
+        "mischievous": ["mischievous", "mischief", "mis chie vous", "mischievus", "mis chuh vuhs", "mischivous"],
+        "wandered": ["wandered", "wander", "wahn derd", "wan der ed", "wonded", "wonde red"],
+        "butterfly": ["butterfly", "butter fly", "but ter fly"],
+        "caterpillar": ["caterpillar", "cater pillar", "cat er pil lar"],
+        "understanding": ["understanding", "understand ing", "un der stand ing"],
+        "edge": ["edge", "ej", "edg", "age"],
+        "bridge": ["bridge", "brij", "bridg"],
+        "knight": ["knight", "night", "nite"],
+        "night": ["night", "nite", "knight"],
+        "through": ["through", "thru", "throo", "throw"],
+        "thought": ["thought", "thawt", "thot"],
+        "laugh": ["laugh", "laf", "laff"],
+        "school": ["school", "skool", "scool"],
+        "friend": ["friend", "frend"],
+        "whispering": ["whispering", "whisper ing", "whisper", "wispuhring", "whis per ing", "wispring"],
+        "whisper": ["whisper", "whis per", "wispuh", "wisper"],
+        "a": ["a", "uh", "ay", "eh", "ah", "8"],
+        "the": ["the", "da", "dee", "thuh", "thee", "th", "d"],
+        "to": ["to", "too", "two", "tu", "2"],
+        "in": ["in", "inn", "en", "an"],
+        "on": ["on", "un", "awn"],
+        "at": ["at", "et", "it"]
+    };
+
+    let SYLLABLE_ALIASES = {
+        "whis": ["whis", "wish", "whiz", "with", "wiss", "ways", "which", "was", "wes", "wis", "wiz", "wist", "whist"],
+        "per": ["per", "purr", "pair", "pear", "par", "pour", "poor", "pur", "for", "fur", "her", "para", "pro", "pr", "bar", "bear"],
+        "ing": ["ing", "in", "ink", "king", "thing", "ring", "eng", "een", "inn"],
+        "mi": ["mi", "me", "mee", "my", "may", "m", "mai"],
+        "so": ["so", "sew", "sow", "soh", "saw", "s", "soul"],
+        "mis": ["mis", "miss", "miz", "mys", "mess", "ms"],
+        "chie": ["chie", "chee", "chuh", "chiv", "chief", "che", "chi", "key", "she", "tea", "gee", "tchi", "chive", "cha", "k", "g", "ch"],
+        "vous": ["vous", "vuhs", "vis", "vus", "vas", "us", "bus", "fuhs", "ves", "vouss", "v"],
+        "wan": ["wan", "wahn", "one", "won", "juan", "when"],
+        "der": ["der", "dur", "dir", "da", "there", "the", "dare", "dr"],
+        "ed": ["ed", "d", "t", "id", "head"],
+        "but": ["but", "butt", "bat", "bot"],
+        "ter": ["ter", "tur", "tir", "tar", "tor", "ta"],
+        "fly": ["fly", "flie", "fli", "ply"],
+        "cat": ["cat", "kat", "cot", "cut"],
+        "er": ["er", "ur", "ir", "a", "or", "ah"],
+        "pil": ["pil", "pill", "pel", "pull"],
+        "lar": ["lar", "ler", "lur", "lor", "la"],
+        "un": ["un", "an", "on", "oon"],
+        "stand": ["stand", "stan", "stun"],
+        "tion": ["tion", "shun", "shan", "shin", "chin"],
+        "sion": ["sion", "shun", "zhun", "zhan"],
+        "ment": ["ment", "munt", "mint", "man"],
+        "ness": ["ness", "nis", "nes"],
+        "ful": ["ful", "full", "fol"],
+        "less": ["less", "lis", "les"]
+    };
+
+    // Jaro-Winkler string distance
+    function jaroWinkler(s1, s2) {
+        if (s1 === s2) return 1.0;
+        let l1 = s1.length, l2 = s2.length;
+        if (l1 === 0 || l2 === 0) return 0.0;
+        let matchDistance = Math.floor(Math.max(l1, l2) / 2) - 1;
+        let s1Matches = new Array(l1).fill(false);
+        let s2Matches = new Array(l2).fill(false);
+        let matches = 0, transpositions = 0;
+
+        for (let i = 0; i < l1; i++) {
+            let start = Math.max(0, i - matchDistance);
+            let end = Math.min(i + matchDistance + 1, l2);
+            for (let j = start; j < end; j++) {
+                if (s2Matches[j] || s1[i] !== s2[j]) continue;
+                s1Matches[i] = true;
+                s2Matches[j] = true;
+                matches++;
+                break;
+            }
+        }
+        if (matches === 0) return 0.0;
+        let k = 0;
+        for (let i = 0; i < l1; i++) {
+            if (!s1Matches[i]) continue;
+            while (!s2Matches[k]) k++;
+            if (s1[i] !== s2[k]) transpositions++;
+            k++;
+        }
+        let sim = (matches / l1 + matches / l2 + (matches - transpositions / 2) / matches) / 3.0;
+        let p = 0.1, prefix = 0;
+        for (let i = 0; i < Math.min(4, Math.min(l1, l2)); i++) {
+            if (s1[i] === s2[i]) prefix++;
+            else break;
+        }
+        return sim + prefix * p * (1 - sim);
+    }
+
+    // Metaphone algorithm: reduces spoken words to consonant-based phonetic roots
+    function metaphone(word) {
+        if (!word) return "";
+        let str = word.toUpperCase().replace(/[^A-Z]/g, "");
+        if (!str) return "";
+
+        // Drop initial silent letters
+        if (/^(KN|GN|PN|AE|WR)/.test(str)) {
+            str = str.substring(1);
+        } else if (/^X/.test(str)) {
+            str = "S" + str.substring(1);
+        } else if (/^WH/.test(str)) {
+            str = "W" + str.substring(2);
+        }
+
+        let meta = "";
+        let len = str.length;
+
+        for (let i = 0; i < len; i++) {
+            let c = str[i];
+            let next = (i < len - 1) ? str[i + 1] : "";
+            let prev = (i > 0) ? str[i - 1] : "";
+
+            if (c === "B") {
+                if (prev === "M" && i === len - 1) continue;
+                meta += "B";
+            } else if (c === "C") {
+                if (next === "H") {
+                    meta += "X";
+                    i++;
+                } else if (next === "I" || next === "E" || next === "Y") {
+                    meta += "S";
+                } else {
+                    meta += "K";
+                }
+            } else if (c === "D") {
+                if (next === "G" && (i + 2 < len) && (str[i + 2] === "E" || str[i + 2] === "I" || str[i + 2] === "Y")) {
+                    meta += "J";
+                    i += 2;
+                } else {
+                    meta += "T";
+                }
+            } else if (c === "G") {
+                if (next === "H" && i === len - 2) continue;
+                if (next === "N" && i === len - 2) continue;
+                if (next === "I" || next === "E" || next === "Y") {
+                    meta += "J";
+                } else {
+                    meta += "K";
+                }
+            } else if (c === "H") {
+                if (/[AEIOU]/.test(next) && (!/[CSPTG]/.test(prev))) {
+                    meta += "H";
+                }
+            } else if (c === "F" || c === "J" || c === "L" || c === "M" || c === "N" || c === "R") {
+                meta += c;
+            } else if (c === "K") {
+                if (prev !== "C") meta += "K";
+            } else if (c === "P") {
+                if (next === "H") {
+                    meta += "F";
+                    i++;
+                } else {
+                    meta += "P";
+                }
+            } else if (c === "Q") {
+                meta += "K";
+            } else if (c === "S") {
+                if (next === "H") {
+                    meta += "X";
+                    i++;
+                } else {
+                    meta += "S";
+                }
+            } else if (c === "T") {
+                if (next === "H") {
+                    meta += "0";
+                    i++;
+                } else if (next === "I" && (i + 2 < len) && (str[i + 2] === "O" || str[i + 2] === "A")) {
+                    meta += "X";
+                } else {
+                    meta += "T";
+                }
+            } else if (c === "V") {
+                meta += "F";
+            } else if (c === "W" || c === "Y") {
+                if (/[AEIOU]/.test(next)) meta += c;
+            } else if (c === "X") {
+                meta += "KS";
+            } else if (c === "Z") {
+                meta += "S";
+            } else if (i === 0 && /[AEIOU]/.test(c)) {
+                meta += c;
+            }
+        }
+        return meta;
+    }
+
+    // Hybrid Jaro-Winkler (60%) + Double Metaphone (40%) Similarity
+    function computePhoneticSimilarity(w1, w2) {
+        if (!w1 || !w2) return 0.0;
+        
+        let w1Clean = w1.replace(/[\s\-]/g, '');
+        let w2Clean = w2.replace(/[\s\-]/g, '');
+
+        if (w1Clean === w2Clean) return 1.0;
+
+        let strSim = Math.max(
+            jaroWinkler(w1, w2),
+            jaroWinkler(w1Clean, w2Clean)
+        );
+
+        let m1 = metaphone(w1Clean);
+        let m2 = metaphone(w2Clean);
+
+        if (m1 && m2) {
+            let metaSim = (m1 === m2) ? 1.0 : jaroWinkler(m1, m2);
+            return (strSim * 0.6) + (metaSim * 0.4);
+        }
+        return strSim;
+    }
+
+    function cleanWord(str) {
+        return (str || '').replace(/[^\w]/g, '').toLowerCase();
+    }
+
+    // Strict Whole-Word Matcher (Requires full length; single prefix like 'mi' will NEVER match 'miso')
+    function matchWholeWord(targetWord, spokenPhrase) {
+        const targetClean = cleanWord(targetWord);
+        const spokenClean = cleanWord(spokenPhrase);
+
+        if (!targetClean || !spokenClean) return false;
+        if (targetClean === spokenClean) return true;
+
+        // 1. Direct Whole-Word Alias Lookup (e.g. "miso" <-> "meeso", "mischievous" <-> "mischief")
+        if (WHOLE_WORD_ALIASES[targetClean] && WHOLE_WORD_ALIASES[targetClean].includes(spokenClean)) {
+            return true;
+        }
+
+        // 2. Anti-Prefix Guard: Spoken phrase MUST have at least 70% of target word length
+        if (spokenClean.length < Math.floor(targetClean.length * 0.70)) {
+            return false;
+        }
+
+        // 3. Metaphone Check for whole word
+        const mTarget = metaphone(targetClean);
+        const mSpoken = metaphone(spokenClean);
+        if (mTarget && mSpoken && mTarget === mSpoken) {
+            return true;
+        }
+
+        // 4. Composite Similarity (Strict >= 0.85)
+        const sim = computePhoneticSimilarity(targetClean, spokenClean);
+        return sim >= 0.85;
+    }
+
+    // Enhanced Syllable Matcher (Tuned specifically for individual phonetic chunks e.g. "whis", "per", "ing", "mi", "so")
+    function matchSyllable(targetSyllable, spokenToken) {
+        const sylClean = cleanWord(targetSyllable);
+        if (!sylClean || !spokenToken) return false;
+
+        // If spokenToken has multiple words/hyphens, check each word as well as the whole string
+        const tokens = (typeof spokenToken === 'string')
+            ? spokenToken.toLowerCase().split(/[\s\-.]+/).map(cleanWord).filter(Boolean)
+            : [cleanWord(spokenToken)];
+
+        if (tokens.length === 0) return false;
+
+        for (const spkClean of tokens) {
+            if (!spkClean) continue;
+            if (sylClean === spkClean) return true;
+
+            // 1. Syllable Alias Table Check
+            if (SYLLABLE_ALIASES[sylClean] && SYLLABLE_ALIASES[sylClean].includes(spkClean)) {
+                return true;
+            }
+
+            // 2. Metaphone Check
+            const mTarget = metaphone(sylClean);
+            const mSpoken = metaphone(spkClean);
+            if (mTarget && mSpoken && mTarget === mSpoken) {
+                return true;
+            }
+
+            // 3. Short Syllable Tolerant Match
+            const sylSim = Math.max(
+                computePhoneticSimilarity(sylClean, spkClean),
+                jaroWinkler(sylClean, spkClean)
+            );
+            if (sylSim >= 0.65) return true;
+
+            // 4. Prefix match for syllables >= 3 chars
+            if (sylClean.length >= 3 && (spkClean.startsWith(sylClean) || sylClean.startsWith(spkClean))) {
+                if (Math.abs(sylClean.length - spkClean.length) <= 2) return true;
+            }
+        }
+
+        // Check joined tokens
+        const joined = tokens.join('');
+        if (joined === sylClean) return true;
+        if (SYLLABLE_ALIASES[sylClean] && SYLLABLE_ALIASES[sylClean].includes(joined)) return true;
+
+        return false;
+    }
+
+    // Phoneme-Level Pronunciation & Continuous Blending Evaluator
+    // Enforces the core rule: ASR Lexical Match != Pronunciation Mastery
+    function evaluatePronunciation(params) {
+        const { targetWord, targetSyllables, spokenTranscript, attemptNumber = 1 } = params;
+        const cleanTarget = cleanWord(targetWord);
+        const spokenClean = (spokenTranscript || "").trim().toLowerCase();
+        const chunks = spokenClean.split(/[\s\-.]+/).filter(Boolean);
+        const joinedSpoken = chunks.join("");
+        const isMonosyllable = (!targetSyllables || targetSyllables.length <= 1);
+        
+        // 1. Exact continuous fluent match (single token, no segmentation)
+        if (spokenClean === cleanTarget || (chunks.length === 1 && chunks[0] === cleanTarget)) {
+            return {
+                lexicalMatch: true,
+                phonemeMatch: true,
+                syllableMatch: true,
+                blendingScore: 1.0,
+                errorType: "CORRECT_FLUENT",
+                mastery: true,
+                coachingRequired: false,
+                feedbackPrompt: `Super! You read "${cleanTarget}" smoothly!`
+            };
+        }
+        
+        // 2. Segmented correct word (ANTI-FALSE-POSITIVE: ASR lexical match != mastery)
+        // e.g., "gla-de", "gla de", "g l ay d", "gla...de"
+        if (joinedSpoken === cleanTarget || chunks.join(" ") === cleanTarget || matchWholeWord(cleanTarget, spokenClean)) {
+            let feedback = "";
+            if (attemptNumber === 1) {
+                feedback = `Almost! Let's blend it smoothly. Listen: ${cleanTarget}.`;
+            } else if (attemptNumber === 2) {
+                feedback = `Good try. Keep the sounds connected: ${cleanTarget}. Try it smoothly.`;
+            } else {
+                feedback = `Let's put the sounds together into one smooth word: ${cleanTarget}.`;
+            }
+            
+            return {
+                lexicalMatch: true,
+                phonemeMatch: true,
+                syllableMatch: isMonosyllable ? false : (chunks.length === targetSyllables.length),
+                blendingScore: 0.65,
+                errorType: "CORRECT_NEEDS_SMOOTHING",
+                mastery: false, // REJECT FALSE POSITIVE
+                coachingRequired: true,
+                feedbackPrompt: feedback
+            };
+        }
+        
+        // 3. Phonetic distance check
+        const sim = computePhoneticSimilarity(cleanTarget, spokenClean);
+        let errorType = "UNRECOGNIZED";
+        let feedback = `Listen closely: ${cleanTarget}. Now your turn!`;
+        
+        if (joinedSpoken.length > cleanTarget.length + 2) {
+            errorType = "PHONEME_ADDITION";
+            feedback = `Keep the sound pure without extra syllables. Listen: ${cleanTarget}.`;
+        } else if (joinedSpoken.length < cleanTarget.length - 2 && sim > 0.50) {
+            errorType = "PHONEME_DELETION";
+            feedback = `Don't miss the inner sounds. Listen: ${cleanTarget}.`;
+        } else if (sim >= 0.75) {
+            errorType = "PHONEME_SUBSTITUTION";
+            feedback = `Almost! Check the individual sounds. Listen: ${cleanTarget}.`;
+        } else if (isMonosyllable && chunks.length > 1) {
+            errorType = "SYLLABLE_SEGMENTATION_ERROR";
+            feedback = `"${cleanTarget}" is one single sound. Say it together: ${cleanTarget}.`;
+        }
+        
+        return {
+            lexicalMatch: false,
+            phonemeMatch: (sim >= 0.85),
+            syllableMatch: false,
+            blendingScore: Math.round(sim * 100) / 100,
+            errorType: errorType,
+            mastery: false,
+            coachingRequired: true,
+            feedbackPrompt: feedback
+        };
+    }
+
+    function splitPassageIntoLines(passage) {
+        if (!passage) return [];
+        const rawLines = passage.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        const result = [];
+        rawLines.forEach(line => {
+            const words = line.split(/\s+/);
+            if (words.length > 12) {
+                let chunk = [];
+                words.forEach(w => {
+                    chunk.push(w);
+                    if (chunk.length >= 8 && /[.!?,;:]$/.test(w)) {
+                        result.push(chunk.join(' '));
+                        chunk = [];
+                    }
+                });
+                if (chunk.length > 0) result.push(chunk.join(' '));
+            } else {
+                result.push(line);
+            }
+        });
+        return result.length > 0 ? result : [passage];
+    }
+
+    // Rule-based client phonetic fallback
+    function getPhoneticGuideLocal(word) {
+        const clean = cleanWord(word);
+        return {
+            word: clean,
+            respelling: clean,
+            ipa: `/${clean}/`,
+            syllables: [clean],
+            blending_steps: [
+                { label: "Whole Word", formula: `[ ${clean} ]`, spoken_target: clean }
+            ]
+        };
+    }
+
+    // Hardware microphone mute / unmute to prevent loopback exploits
+    function setMicrophoneEnabled(enabled) {
+        if (microphoneStream) {
+            microphoneStream.getAudioTracks().forEach(track => {
+                track.enabled = enabled;
+            });
+        }
+    }
+
+    // Stop and cancel all previously playing audio streams immediately
+    function stopAllPlayingAudio() {
+        if (currentPlayingAudio) {
+            try {
+                currentPlayingAudio.pause();
+                currentPlayingAudio.src = "";
+            } catch(e) {}
+            currentPlayingAudio = null;
+        }
+        if ('speechSynthesis' in window) {
+            try { window.speechSynthesis.cancel(); } catch(e) {}
+        }
+        if (audioCooldownTimer) {
+            clearTimeout(audioCooldownTimer);
+            audioCooldownTimer = null;
+        }
+    }
+
+    // Single-instance safe audio playback with strict hardware mic muting and acoustic flush
+    function safePlayWordAudio(word, voiceName, callback) {
+        stopAllPlayingAudio();
+
+        isAudioPlaying = true;
+        setMicrophoneEnabled(false); // HARD MUTE MIC to prevent loopback
+
+        const cleaned = cleanWord(word);
+        const b64Audio = wordAudioMap[cleaned];
+
+        function onPlaybackFinished() {
+            liveTranscript = "";
+            audioCooldownTimer = setTimeout(() => {
+                setMicrophoneEnabled(true); // UNMUTE MIC after 600ms acoustic silence
+                isAudioPlaying = false;
+                liveTranscript = "";
+                if (callback) callback();
+            }, 600);
+        }
+
+        if (b64Audio) {
+            currentPlayingAudio = new Audio(b64Audio);
+            currentPlayingAudio.onended = () => {
+                currentPlayingAudio = null;
+                onPlaybackFinished();
+            };
+            currentPlayingAudio.onerror = () => {
+                currentPlayingAudio = null;
+                fallbackBrowserTTS(word, onPlaybackFinished);
+            };
+            currentPlayingAudio.play().catch(() => {
+                currentPlayingAudio = null;
+                fallbackBrowserTTS(word, onPlaybackFinished);
+            });
+        } else {
+            fallbackBrowserTTS(word, onPlaybackFinished);
+        }
+    }
+
+    // Progressive Sequential Phonics Sound-Out Player (wan -> wander -> wandered)
+    function playProgressiveSoundOut(steps, voiceName) {
+        if (!steps || steps.length === 0) return;
+        let stepIdx = 0;
+
+        function playNextStep() {
+            if (stepIdx >= steps.length) {
+                return;
+            }
+            const currentStep = steps[stepIdx];
+            const targetWord = currentStep.spoken_target || currentStep.formula;
+            stepIdx++;
+
+            safePlayWordAudio(targetWord, voiceName, () => {
+                if (stepIdx < steps.length) {
+                    setTimeout(playNextStep, 350); // 350ms natural teacher cadence pause between sound steps
+                }
+            });
+        }
+
+        playNextStep();
+    }
+
+    function fallbackBrowserTTS(word, callback) {
+        if ('speechSynthesis' in window) {
+            try { window.speechSynthesis.cancel(); } catch(e) {}
+            const utter = new SpeechSynthesisUtterance(word);
+            utter.lang = 'en-US';
+            utter.rate = 0.85;
+            utter.onend = () => { if (callback) callback(); };
+            utter.onerror = () => { if (callback) callback(); };
+            window.speechSynthesis.speak(utter);
+        } else {
+            if (callback) callback();
+        }
+    }
+
+    function stopAllMedia() {
+        stopAllPlayingAudio();
+        if (microphoneStream) {
+            microphoneStream.getTracks().forEach(t => { try { t.stop(); } catch(e) {} });
+            microphoneStream = null;
+        }
+        if (dataChannel) {
+            try { dataChannel.close(); } catch(e) {}
+            dataChannel = null;
+        }
+        if (pc) {
+            try { pc.close(); } catch(e) {}
+            pc = null;
+        }
+        if (speechRecognition) {
+            try { speechRecognition.stop(); } catch(e) {}
+            speechRecognition = null;
+        }
+        if (interventionTimer) {
+            clearTimeout(interventionTimer);
+            interventionTimer = null;
+        }
+        isAudioPlaying = false;
+    }
+
+    function renderCurrentLineUI() {
+        const lineContainer = document.getElementById("ra-instructional-line");
+        const lineProgress = document.getElementById("ra-instructional-progress");
+        const prevLinesContainer = document.getElementById("ra-instructional-prev-lines");
+
+        if (!lineContainer || currentLineIndex >= lines.length) return;
+
+        if (lineProgress) {
+            lineProgress.textContent = `Line ${currentLineIndex + 1} of ${lines.length}`;
+        }
+
+        const currentLineText = lines[currentLineIndex];
+        const tokens = currentLineText.split(/\s+/);
+
+        let html = "";
+        tokens.forEach((token, idx) => {
+            const isRead = idx < currentWordIndex;
+            const isFocus = idx === currentWordIndex;
+            
+            let cls = "ra-inst-word";
+            if (isRead) cls += " ra-inst-word-read";
+            if (isFocus) cls += " ra-inst-word-focus";
+
+            html += `<span class="${cls}" id="ra-word-${currentLineIndex}-${idx}" onclick="InstructionalReader.playWord('${token}')">${token}</span> `;
+        });
+
+        lineContainer.innerHTML = html;
+
+        if (prevLinesContainer) {
+            if (currentLineIndex > 0) {
+                prevLinesContainer.innerHTML = lines.slice(0, currentLineIndex).map(l => `<div class="ra-inst-prev-line">✓ ${l}</div>`).join('');
+                prevLinesContainer.style.display = "block";
+            } else {
+                prevLinesContainer.style.display = "none";
+            }
+        }
+    }
+
+    // Render / Update Syllable Tiles with Live Green / Red / Yellow Highlights
+    function updateSyllableTilesUI() {
+        const container = document.getElementById("ra-syllables-container");
+        if (!container || !isolatedSyllables || isolatedSyllables.length <= 1) return;
+
+        let html = "";
+        isolatedSyllables.forEach((syl, idx) => {
+            const st = syllableStatus[idx] || 'pending';
+            let cls = "ra-syllable-tile";
+            let indicator = "";
+
+            if (st === 'good') {
+                cls += " ra-syllable-tile-good";
+                indicator = " ✓";
+            } else if (st === 'miscue') {
+                cls += " ra-syllable-tile-miscue";
+                indicator = " ✕";
+            } else if (idx === activeSyllableIndex) {
+                cls += " ra-syllable-tile-focus";
+            }
+
+            html += `<span class="${cls}" id="ra-syl-tile-${idx}" onclick="InstructionalReader.playWord('${syl}')">${syl}${indicator}</span>`;
+            if (idx < isolatedSyllables.length - 1) {
+                html += `<span class="ra-syllable-divider">·</span>`;
+            }
+        });
+
+        container.innerHTML = html;
+    }
+
+    function updateMasteryBadgeUI() {
+        const chip = document.getElementById("ra-mastery-chip");
+        const promptEl = document.getElementById("ra-iso-prompt-text");
+        if (!chip) return;
+
+        if (wordMasteryCount === 0) {
+            chip.className = "ra-mastery-chip";
+            chip.innerHTML = `🎯 ${wordMasteryTarget}x Mastery Check: <strong>0 of ${wordMasteryTarget} Completed</strong>`;
+            if (promptEl) promptEl.innerHTML = `👩‍🏫 <em>Sound out each syllable tile, or say the full word (${wordMasteryTarget}x to master):</em>`;
+        } else if (wordMasteryCount > 0 && wordMasteryCount < wordMasteryTarget) {
+            const remaining = wordMasteryTarget - wordMasteryCount;
+            chip.className = "ra-mastery-chip ra-mastery-chip-progress ra-mastery-chip-1x";
+            chip.innerHTML = `⭐ <strong>${wordMasteryCount} of ${wordMasteryTarget} Completed!</strong> Say it ${remaining} more time${remaining > 1 ? 's' : ''} to master it!`;
+            if (promptEl) promptEl.innerHTML = `🌟 <em>Great job! Now say <strong>"${isolatedTargetWord}"</strong> again:</em>`;
+        } else if (wordMasteryCount >= wordMasteryTarget) {
+            chip.className = "ra-mastery-chip ra-mastery-chip-complete ra-mastery-chip-2x";
+            chip.innerHTML = `🌟🌟 <strong>Mastered! (${wordMasteryTarget} of ${wordMasteryTarget} Completed)</strong>`;
+            if (promptEl) promptEl.innerHTML = `🎉 <em>Word Mastered! Returning to story...</em>`;
+        }
+    }
+
+    function markCurrentWordMiscue() {
+        const targetRec = passageWordRecords.find(r => r.line === currentLineIndex && r.index === currentWordIndex);
+        if (targetRec && targetRec.status !== 'miscue') {
+            targetRec.status = 'miscue';
+            miscueCount++;
+            const miscueBadge = document.getElementById("ra-miscue-badge");
+            if (miscueBadge) miscueBadge.textContent = `${miscueCount} Miscue${miscueCount > 1 ? 's' : ''}`;
+        }
+    }
+
+    // Google-Style Phonetic Respelling & Progressive Blending Card (Dynamic Multi-Tier Generation)
+    async function enterWordIsolationMode(targetWord, voiceName, asrServiceUrl) {
+        if (isIsolatedMode) return;
+        isIsolatedMode = true;
+        isIntervening = true;
+        isolatedTargetWord = cleanWord(targetWord);
+        activeSyllableIndex = 0;
+        wordMasteryCount = 0; // Reset mastery requirement (0/N)
+
+        markCurrentWordMiscue();
+
+        const lineContainer = document.getElementById("ra-instructional-line");
+        const coachBox = document.getElementById("ra-coach-bubble");
+
+        // Dim the rest of the sentence
+        if (lineContainer) {
+            lineContainer.classList.add("ra-line-dimmed");
+        }
+
+        let guide = getPhoneticGuideLocal(targetWord);
+        try {
+            const r = await fetch(`${asrServiceUrl}/breakdown_word`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ word: targetWord })
+            });
+            const data = await r.json();
+            if (data.respelling) {
+                guide = data;
+                // Dynamically integrate AI / NLP generated phonetic aliases
+                if (data.aliases && typeof data.aliases === 'object') {
+                    for (const [key, aliasList] of Object.entries(data.aliases)) {
+                        const cleanKey = cleanWord(key);
+                        if (cleanKey === isolatedTargetWord) {
+                            if (!WHOLE_WORD_ALIASES[cleanKey]) WHOLE_WORD_ALIASES[cleanKey] = [];
+                            WHOLE_WORD_ALIASES[cleanKey].push(...aliasList.map(cleanWord));
+                        } else {
+                            if (!SYLLABLE_ALIASES[cleanKey]) SYLLABLE_ALIASES[cleanKey] = [];
+                            SYLLABLE_ALIASES[cleanKey].push(...aliasList.map(cleanWord));
+                        }
+                    }
+                }
+            }
+        } catch(e) {
+            console.warn("Using local rule-based fallback for word isolation:", e);
+        }
+
+        isolatedRespelling = guide.respelling || targetWord;
+        isolatedIpa = guide.ipa || `/${targetWord}/`;
+        isolatedSyllables = guide.syllables || [targetWord];
+        isolatedBlendingSteps = guide.blending_steps || [];
+        syllableStatus = new Array(isolatedSyllables.length).fill('pending');
+
+        let isoCard = document.getElementById("ra-isolation-card");
+        if (!isoCard) {
+            isoCard = document.createElement("div");
+            isoCard.id = "ra-isolation-card";
+            isoCard.className = "ra-isolation-card";
+            if (lineContainer && lineContainer.parentNode) {
+                lineContainer.parentNode.insertBefore(isoCard, lineContainer.nextSibling);
+            }
+        }
+
+        // Render Syllables (only if multi-syllabic)
+        let syllablesHtml = "";
+        if (isolatedSyllables.length > 1) {
+            syllablesHtml = `<div class="ra-syllable-container" id="ra-syllables-container"></div>`;
+        }
+
+        // Render Progressive Blending Steps Rows
+        let stepsHtml = "";
+        if (isolatedBlendingSteps.length > 1) {
+            const stepRows = isolatedBlendingSteps.map(st => `
+                <div class="ra-blending-step-row" onclick="InstructionalReader.playWord('${st.spoken_target}')">
+                    <span class="ra-step-badge">${st.label}</span>
+                    <span class="ra-step-formula">${st.formula}</span>
+                    <span class="ra-step-sound-btn">🔊 Hear</span>
+                </div>
+            `).join('');
+
+            stepsHtml = `
+                <div class="ra-blending-steps-container">
+                    <div style="font-size: 0.95rem; font-weight: 700; color: #475569; margin-bottom: 8px;">📚 Progressive Sound-Out Steps:</div>
+                    ${stepRows}
+                </div>
+            `;
+        }
+
+        const soundoutBtnHtml = (isolatedBlendingSteps.length > 1) ? `
+            <button class="ra-soundout-btn" onclick="InstructionalReader.playSteps()">
+                <span>▶</span> Play Progressive Sound-Out
+            </button>
+        ` : '';
+
+        isoCard.innerHTML = `
+            <div class="ra-isolation-header">👩‍🏫 Teacher Sound-Out & Blending Guide:</div>
+            <div class="ra-mastery-container">
+                <span class="ra-mastery-chip" id="ra-mastery-chip">🎯 ${wordMasteryTarget}x Mastery Check: <strong>0 of ${wordMasteryTarget} Completed</strong></span>
+            </div>
+            <div class="ra-target-word-display">${targetWord}</div>
+            <div class="ra-phonetic-badge-container">
+                <span class="ra-phonetic-respelling">Phonetic: <strong>[ ${isolatedRespelling} ]</strong></span>
+                <span class="ra-ipa-guide">${isolatedIpa}</span>
+            </div>
+            ${syllablesHtml}
+            ${stepsHtml}
+            <div class="ra-blending-actions">
+                ${soundoutBtnHtml}
+                <button class="ra-listen-btn" onclick="InstructionalReader.playWord('${targetWord}')">
+                    <span>🔊</span> Hear Full Word
+                </button>
+            </div>
+            <div class="ra-isolation-prompt" id="ra-iso-prompt-text">👩‍🏫 <em>Sound out each syllable tile, or say the full word (${wordMasteryTarget}x to master):</em></div>
+        `;
+        isoCard.style.display = "block";
+
+        updateSyllableTilesUI();
+        updateMasteryBadgeUI();
+
+        if (coachBox) coachBox.style.display = "none";
+
+        // Play whole word teacher audio with loopback protection
+        safePlayWordAudio(targetWord, voiceName, () => {
+            isIntervening = false;
+        });
+    }
+
+    function exitWordIsolationMode() {
+        isIsolatedMode = false;
+        isIntervening = false;
+        isolatedTargetWord = "";
+        isolatedSyllables = [];
+        isolatedBlendingSteps = [];
+        activeSyllableIndex = 0;
+        syllableStatus = [];
+        wordMasteryCount = 0;
+
+        const lineContainer = document.getElementById("ra-instructional-line");
+        const isoCard = document.getElementById("ra-isolation-card");
+        const coachBox = document.getElementById("ra-coach-bubble");
+
+        if (lineContainer) {
+            lineContainer.classList.remove("ra-line-dimmed");
+        }
+        if (isoCard) {
+            isoCard.style.display = "none";
+        }
+        if (coachBox) {
+            coachBox.style.display = "none";
+        }
+    }
+
+    function init(config) {
+        lines = splitPassageIntoLines(config.passage || "");
+        currentLineIndex = 0;
+        currentWordIndex = 0;
+        miscueCount = 0;
+        wordMasteryCount = 0;
+        if (config.mastery_repetitions !== undefined && config.mastery_repetitions !== null) {
+            const parsedTarget = parseInt(config.mastery_repetitions, 10);
+            wordMasteryTarget = (!isNaN(parsedTarget) && parsedTarget > 0) ? parsedTarget : 2;
+        } else {
+            wordMasteryTarget = 2;
+        }
+        readingStartTime = null;
+        totalReadingTimeSeconds = 0;
+        calculatedReadingSpeedWPM = 0;
+
+        // Initialize full word records map covering every word in order
+        passageWordRecords = [];
+        lines.forEach((lineText, lIdx) => {
+            const tokens = lineText.split(/\s+/);
+            tokens.forEach((tok, wIdx) => {
+                const clean = cleanWord(tok);
+                if (clean) {
+                    passageWordRecords.push({
+                        word: clean,
+                        line: lIdx,
+                        index: wIdx,
+                        status: "good", // default to good until coached
+                        spoken: clean
+                    });
+                }
+            });
+        });
+
+        const startBtn = document.getElementById("ra-btn-inst-start");
+        const coachBox = document.getElementById("ra-coach-bubble");
+        const statusText = document.getElementById("ra-inst-status");
+        const asrServiceUrl = config.asr_service_url || ASR_SERVICE_URL;
+        const voice = config.tts_voice || "alloy";
+
+        renderCurrentLineUI();
+
+        // Pre-fetch word TTS audio via OpenAI TTS API in background (OpenAI TTS Guide)
+        const allWords = (config.passage || "").split(/\s+/);
+        fetch(`${asrServiceUrl}/tts_words`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                words: allWords,
+                voice: voice,
+                instructions: config.tts_personality_prompt || "",
+                speed: 0.88
+            })
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data && data.audio_map) wordAudioMap = data.audio_map;
+        })
+        .catch(e => console.warn("TTS audio pre-fetch fallback to browser:", e));
+
+        function updateLiveStatus(statusMsg) {
+            if (statusText) {
+                statusText.textContent = statusMsg;
+            }
+        }
+
+        function handleCoachingCompletion() {
+            wordMasteryCount++;
+            updateMasteryBadgeUI();
+
+            if (wordMasteryCount < wordMasteryTarget) {
+                // Flash all green and reset for next mastery attempt
+                syllableStatus = new Array(isolatedSyllables.length).fill('good');
+                updateSyllableTilesUI();
+
+                setTimeout(() => {
+                    activeSyllableIndex = 0;
+                    syllableStatus = new Array(isolatedSyllables.length).fill('pending');
+                    updateSyllableTilesUI();
+                }, 800);
+            } else {
+                // Target repetitions completed -> Full mastery achieved!
+                syllableStatus = new Array(isolatedSyllables.length).fill('good');
+                updateSyllableTilesUI();
+
+                setTimeout(() => {
+                    advanceWordSuccessfully();
+                }, 600);
+            }
+        }
+
+        function handleSpokenTranscript(spokenPhrase) {
+            // Anti-exploit: strictly drop any speech received while system audio is playing
+            if (isAudioPlaying || currentLineIndex >= lines.length) return;
+
+            const currentLineTokens = lines[currentLineIndex].split(/\s+/);
+            if (currentWordIndex >= currentLineTokens.length) return;
+
+            const targetToken = currentLineTokens[currentWordIndex];
+            const targetClean = cleanWord(targetToken);
+
+            const spokenTokens = spokenPhrase.trim().toLowerCase().split(/\s+/);
+            const latestSpoken = cleanWord(spokenTokens[spokenTokens.length - 1]);
+            const fullSpokenChunk = cleanWord(spokenTokens.slice(-4).join(" "));
+
+            // Comprehensive phoneme & blending evaluation
+            const evalResult = evaluatePronunciation({
+                targetWord: targetClean,
+                targetSyllables: isIsolatedMode ? isolatedSyllables : [targetClean],
+                spokenTranscript: spokenPhrase,
+                attemptNumber: coachingAttemptNumber
+            });
+
+            // --- Case A: Inside Teacher Sound-Out Guide (Dynamic Mastery & Syllable Matching) ---
+            if (isIsolatedMode) {
+                // 1. Direct Whole-Word Fluent Pronunciation Check (Bypasses remaining tiles if spoken smoothly)
+                const isWholeWordSpoken = matchWholeWord(targetClean, latestSpoken) ||
+                                          matchWholeWord(targetClean, fullSpokenChunk) ||
+                                          matchWholeWord(targetClean, spokenPhrase) ||
+                                          evalResult.errorType === 'CORRECT_FLUENT';
+
+                if (isWholeWordSpoken) {
+                    liveTranscript = "";
+                    finalTranscript = "";
+                    handleCoachingCompletion();
+                    return;
+                }
+
+                // 2. Active Syllable Sound-Out & Progressive Cumulative Blending Check
+                if (isolatedSyllables.length > 1 && activeSyllableIndex < isolatedSyllables.length) {
+                    const targetSyl = cleanWord(isolatedSyllables[activeSyllableIndex]);
+                    const cumulativeBlend = cleanWord(isolatedSyllables.slice(0, activeSyllableIndex + 1).join(''));
+
+                    const isSylMatched = matchSyllable(targetSyl, latestSpoken) ||
+                                         matchSyllable(targetSyl, fullSpokenChunk) ||
+                                         matchSyllable(targetSyl, spokenPhrase) ||
+                                         matchWholeWord(cumulativeBlend, latestSpoken) ||
+                                         matchWholeWord(cumulativeBlend, fullSpokenChunk) ||
+                                         matchWholeWord(cumulativeBlend, spokenPhrase);
+
+                    if (isSylMatched) {
+                        // Mark active syllable green
+                        syllableStatus[activeSyllableIndex] = 'good';
+                        activeSyllableIndex++;
+                        updateSyllableTilesUI();
+
+                        // Flush transcript buffers to prevent audio residue on next syllable
+                        liveTranscript = "";
+                        finalTranscript = "";
+
+                        // If all syllables in this word completed
+                        if (activeSyllableIndex >= isolatedSyllables.length) {
+                            handleCoachingCompletion();
+                            return;
+                        }
+                    } else if (latestSpoken.length >= 2 && !matchSyllable(targetSyl, latestSpoken) && !matchWholeWord(targetClean, latestSpoken)) {
+                        // Incorrect sound on current tile -> Flash red
+                        syllableStatus[activeSyllableIndex] = 'miscue';
+                        updateSyllableTilesUI();
+
+                        setTimeout(() => {
+                            if (syllableStatus[activeSyllableIndex] === 'miscue') {
+                                syllableStatus[activeSyllableIndex] = 'focus';
+                                updateSyllableTilesUI();
+                            }
+                        }, 800);
+                    }
+                } else if (isolatedSyllables.length <= 1) {
+                    // Monosyllable word in isolation mode
+                    if (evalResult.errorType === 'CORRECT_NEEDS_SMOOTHING') {
+                        const promptEl = document.getElementById("ra-iso-prompt-text");
+                        if (promptEl) {
+                            promptEl.innerHTML = `⚠️ <span class="ra-blend-needs-smoothing" style="color: #b45309; font-weight: 700;">${evalResult.feedbackPrompt}</span>`;
+                        }
+                        coachingAttemptNumber++;
+                        safePlayWordAudio(targetToken, voice, () => {});
+                        return;
+                    }
+                }
+                return;
+            }
+
+            // --- Case B: Normal Line-by-Line Reading ---
+            if (evalResult.errorType === 'CORRECT_FLUENT') {
+                advanceWordSuccessfully();
+            } else if (evalResult.errorType === 'CORRECT_NEEDS_SMOOTHING') {
+                // Segmented reading of word on normal line -> enter word isolation to smooth out
+                enterWordIsolationMode(targetToken, voice, asrServiceUrl);
+            } else {
+                // Potential mispronunciation or delay -> trigger Sound-Out Guide
+                if (!interventionTimer && !isIsolatedMode) {
+                    interventionTimer = setTimeout(() => {
+                        enterWordIsolationMode(targetToken, voice, asrServiceUrl);
+                    }, 3000);
+                }
+            }
+        }
+
+        function advanceWordSuccessfully() {
+            if (interventionTimer) {
+                clearTimeout(interventionTimer);
+                interventionTimer = null;
+            }
+
+            if (isIsolatedMode) {
+                exitWordIsolationMode();
+            }
+
+            if (coachBox) coachBox.style.display = "none";
+
+            const currentLineTokens = lines[currentLineIndex].split(/\s+/);
+
+            // Mark word good in active line
+            const activeWordEl = document.getElementById(`ra-word-${currentLineIndex}-${currentWordIndex}`);
+            if (activeWordEl) {
+                activeWordEl.classList.remove("ra-inst-word-focus", "ra-inst-word-miscue");
+                activeWordEl.classList.add("ra-inst-word-good");
+            }
+
+            currentWordIndex++;
+
+            // Check if line complete
+            if (currentWordIndex >= currentLineTokens.length) {
+                currentLineIndex++;
+                currentWordIndex = 0;
+
+                if (currentLineIndex < lines.length) {
+                    renderCurrentLineUI();
+                    resetHesitationTimer(lines[currentLineIndex].split(/\s+/)[0]);
+                } else {
+                    finishStory();
+                }
+            } else {
+                renderCurrentLineUI();
+                resetHesitationTimer(currentLineTokens[currentWordIndex]);
+            }
+        }
+
+        function resetHesitationTimer(nextWord) {
+            if (interventionTimer) clearTimeout(interventionTimer);
+            if (!nextWord) return;
+            interventionTimer = setTimeout(() => {
+                enterWordIsolationMode(nextWord, voice, asrServiceUrl);
+            }, 4500); // 4.5s hesitation timeout
+        }
+
+        async function startWebRTCEngine() {
+            try {
+                let clientSecret = null;
+                try {
+                    const sessResp = await fetch(`${asrServiceUrl}/session`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ personality: config.tts_personality_prompt || "" })
+                    });
+                    const sessData = await sessResp.json().catch(() => ({}));
+                    if (sessResp.ok && sessData.client_secret) {
+                        clientSecret = sessData.client_secret;
+                    }
+                } catch(e) {
+                    console.warn("Could not reach Python ASR service /session endpoint:", e);
+                }
+
+                if (clientSecret) {
+                    activeEngineName = "OpenAI Realtime (gpt-live-transcribe)";
+                    pc = new RTCPeerConnection();
+                    dataChannel = pc.createDataChannel("oai-events");
+
+                    dataChannel.onopen = () => {
+                        updateLiveStatus(`Listening (${activeEngineName})... Reading Line ${currentLineIndex + 1} of ${lines.length}.`);
+                        dataChannel.send(JSON.stringify({
+                            type: "session.update",
+                            session: {
+                                type: "transcription",
+                                audio: {
+                                    input: {
+                                        transcription: { model: "gpt-live-transcribe", delay: "minimal" },
+                                        turn_detection: null
+                                    }
+                                }
+                            }
+                        }));
+                    };
+
+                    dataChannel.onmessage = (event) => {
+                        const msg = JSON.parse(event.data);
+                        if (msg.type === "conversation.item.input_audio_transcription.delta") {
+                            liveTranscript += (msg.delta || "");
+                            handleSpokenTranscript(msg.delta || "");
+                        } else if (msg.type === "conversation.item.input_audio_transcription.completed") {
+                            finalTranscript += (msg.transcript || "") + " ";
+                            liveTranscript = "";
+                            handleSpokenTranscript(msg.transcript || "");
+                        }
+                    };
+
+                    microphoneStream = await navigator.mediaDevices.getUserMedia({
+                        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+                    });
+
+                    microphoneStream.getTracks().forEach(track => pc.addTrack(track, microphoneStream));
+
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+
+                    const sdpResp = await fetch("https://api.openai.com/v1/realtime/calls", {
+                        method: "POST",
+                        body: offer.sdp,
+                        headers: {
+                            "Authorization": `Bearer ${clientSecret}`,
+                            "Content-Type": "application/sdp"
+                        }
+                    });
+
+                    if (!sdpResp.ok) throw new Error(await sdpResp.text());
+                    const answerSdp = await sdpResp.text();
+                    await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+
+                } else {
+                    activeEngineName = "Browser Speech Engine (Offline Fallback)";
+                    const SpeechRecognitionClass = window.SpeechRecognition || window.webkitSpeechRecognition;
+                    if (SpeechRecognitionClass) {
+                        speechRecognition = new SpeechRecognitionClass();
+                        speechRecognition.continuous = true;
+                        speechRecognition.interimResults = true;
+                        speechRecognition.lang = 'en-US';
+
+                        speechRecognition.onresult = (event) => {
+                            let interim = '';
+                            for (let i = event.resultIndex; i < event.results.length; ++i) {
+                                if (event.results[i].isFinal) {
+                                    finalTranscript += event.results[i][0].transcript + ' ';
+                                    handleSpokenTranscript(event.results[i][0].transcript);
+                                } else {
+                                    interim += event.results[i][0].transcript;
+                                    handleSpokenTranscript(interim);
+                                }
+                            }
+                        };
+                        speechRecognition.start();
+                        updateLiveStatus(`Listening (${activeEngineName})... Reading Line ${currentLineIndex + 1} of ${lines.length}.`);
+                    } else {
+                        updateLiveStatus("Error: ASR service offline and Browser Speech API not supported.");
+                    }
+                }
+
+            } catch (err) {
+                console.error("Instructional WebRTC start error:", err);
+                activeEngineName = "Browser Speech Engine (Fallback)";
+                updateLiveStatus(`Listening (${activeEngineName})... Reading Line ${currentLineIndex + 1} of ${lines.length}.`);
+            }
+        }
+
+        function finishStory() {
+            stopAllMedia();
+            if (isIsolatedMode) exitWordIsolationMode();
+            isRecording = false;
+
+            // Reading Speed = (No. of words read ÷ Reading time in seconds) × 60
+            if (readingStartTime) {
+                totalReadingTimeSeconds = Math.max(1, Math.round((Date.now() - readingStartTime) / 1000));
+            } else {
+                totalReadingTimeSeconds = 30;
+            }
+
+            const totalWords = passageWordRecords.length;
+            const accuracyScore = (totalWords > 0) ? Math.max(0, ((totalWords - miscueCount) / totalWords) * 100).toFixed(2) : "100.00";
+            calculatedReadingSpeedWPM = Math.round(((totalWords / totalReadingTimeSeconds) * 60) * 100) / 100;
+
+            if (statusText) {
+                statusText.innerHTML = `🎉 <strong>Story Completed!</strong> Total Words: ${totalWords} | Miscues: ${miscueCount} | Reading Accuracy: <strong>${accuracyScore}%</strong> | ⚡ Reading Speed: <strong>${calculatedReadingSpeedWPM} WPM</strong> (${totalReadingTimeSeconds}s).`;
+            }
+
+            // Show Comprehension / Quiz Section
+            const qSection = document.getElementById("ra-instructional-quiz");
+            const linkedQuizCard = document.getElementById("ra-linked-quiz-card");
+
+            if (linkedQuizCard) {
+                linkedQuizCard.style.display = "block";
+                linkedQuizCard.scrollIntoView({ behavior: "smooth", block: "start" });
+            } else if (qSection) {
+                qSection.style.display = "block";
+                qSection.scrollIntoView({ behavior: "smooth", block: "start" });
+            }
+
+            if (startBtn) {
+                startBtn.disabled = true;
+                startBtn.textContent = "✓ Story Completed";
+            }
+        }
+
+        if (startBtn) {
+            startBtn.addEventListener("click", async () => {
+                if (!isRecording) {
+                    isRecording = true;
+                    if (!readingStartTime) {
+                        readingStartTime = Date.now();
+                    }
+                    startBtn.textContent = "⏹ Stop Reading";
+                    startBtn.className = "ra-btn ra-btn-done";
+
+                    renderCurrentLineUI();
+                    updateLiveStatus("Connecting to speech engine...");
+
+                    await startWebRTCEngine();
+
+                    const curLineWords = (lines[currentLineIndex] || "").split(/\s+/);
+                    const activeWord = curLineWords[currentWordIndex] || curLineWords[0];
+                    resetHesitationTimer(activeWord);
+
+                } else {
+                    stopAllMedia();
+                    if (isIsolatedMode) exitWordIsolationMode();
+                    isRecording = false;
+                    startBtn.textContent = "▶ Resume Reading";
+                    startBtn.className = "ra-btn ra-btn-start";
+                    if (statusText) {
+                        statusText.textContent = `Paused at Line ${currentLineIndex + 1} of ${lines.length}. Click [Resume Reading] to continue.`;
+                    }
+                }
+            });
+        }
+
+        // Handle Questionnaire submission with Python evaluate_instructional endpoint
+        const submitBtn = document.getElementById("ra-btn-inst-submit");
+        if (submitBtn) {
+            submitBtn.addEventListener("click", async () => {
+                submitBtn.disabled = true;
+                if (statusText) statusText.textContent = "Evaluating assessment via Python service...";
+
+                const questions = config.questions || [];
+                const studentAnswers = [];
+                questions.forEach((q, idx) => {
+                    const qtype = q.type || 'multichoice';
+                    if (qtype === 'description') {
+                        studentAnswers.push(null);
+                    } else if (qtype === 'multichoice') {
+                        const selected = document.querySelector(`input[name="ra_q_${idx}"]:checked`);
+                        studentAnswers.push(selected ? parseInt(selected.value) : -1);
+                    } else if (qtype === 'truefalse') {
+                        const selected = document.querySelector(`input[name="ra_q_${idx}"]:checked`);
+                        studentAnswers.push(selected ? (selected.value === 'true') : null);
+                    } else if (qtype === 'matching' || qtype === 'randommatch') {
+                        const pairs = q.pairs || [];
+                        const pairAns = [];
+                        pairs.forEach((p, pidx) => {
+                            const sel = document.querySelector(`select[name="ra_q_${idx}_p_${pidx}"]`);
+                            pairAns.push(sel ? sel.value : '');
+                        });
+                        studentAnswers.push(pairAns);
+                    } else if (qtype === 'ordering') {
+                        const selects = document.querySelectorAll(`select[name^="ra_q_${idx}_ord_"]`);
+                        const orderAns = [];
+                        selects.forEach(sel => {
+                            const span = sel.nextElementSibling;
+                            orderAns.push({ order: parseInt(sel.value), text: span ? span.getAttribute('data-itemtext') : '' });
+                        });
+                        orderAns.sort((a, b) => a.order - b.order);
+                        studentAnswers.push(orderAns.map(o => o.text));
+                    } else if (qtype === 'essay') {
+                        const ta = document.querySelector(`textarea[name="ra_q_${idx}"]`);
+                        studentAnswers.push(ta ? ta.value : '');
+                    } else {
+                        const inp = document.querySelector(`input[name="ra_q_${idx}"]`);
+                        studentAnswers.push(inp ? inp.value : '');
+                    }
+                });
+
+                // Prepare exact per-word feedback array for Moodle previous attempts view
+                const formattedWordFeedback = passageWordRecords.map(r => ({
+                    word: r.word,
+                    status: r.status, // 'good' or 'miscue'
+                    similarity: (r.status === 'good') ? 1.0 : 0.0,
+                    spoken: (r.status === 'good') ? r.word : ''
+                }));
+
+                const totalWords = passageWordRecords.length;
+                let clientCalculatedAccuracy = (totalWords > 0) ? Math.max(0, ((totalWords - miscueCount) / totalWords) * 100) : 100.0;
+                clientCalculatedAccuracy = Math.round(clientCalculatedAccuracy * 100) / 100;
+
+                let evalData = {
+                    accuracy_score: clientCalculatedAccuracy,
+                    comprehension_score: 100.0,
+                    final_grade: clientCalculatedAccuracy,
+                    reading_time: totalReadingTimeSeconds,
+                    reading_speed: calculatedReadingSpeedWPM,
+                    word_feedback: formattedWordFeedback
+                };
+
+                try {
+                    const evalResp = await fetch(`${asrServiceUrl}/evaluate_instructional`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            passage: config.passage,
+                            transcript: finalTranscript,
+                            miscue_count: miscueCount,
+                            word_feedback: formattedWordFeedback,
+                            reading_time: totalReadingTimeSeconds,
+                            reading_speed: calculatedReadingSpeedWPM,
+                            answers: studentAnswers,
+                            correct_answers: questions.map(q => q.correct !== undefined ? q.correct : 0),
+                            readingassessmentid: config.readingassessmentid,
+                            userid: config.userid
+                        })
+                    });
+
+                    if (evalResp.ok) {
+                        evalData = await evalResp.json();
+                    }
+                } catch (e) {
+                    console.warn("Using client-side evaluation fallback:", e);
+                }
+
+                try {
+                    const wwwroot = config.wwwroot || window.location.origin;
+                    const submitUrl = `${wwwroot}/mod/readingassessment/view.php?id=${config.cmid}&action=submit`;
+
+                    const params = new URLSearchParams({
+                        transcript: finalTranscript || config.passage,
+                        accuracy_score: evalData.accuracy_score,
+                        comprehension_score: evalData.comprehension_score,
+                        final_grade: evalData.final_grade,
+                        reading_time: totalReadingTimeSeconds,
+                        reading_speed: calculatedReadingSpeedWPM,
+                        miscues_json: JSON.stringify(evalData.word_feedback || formattedWordFeedback),
+                        answers_json: JSON.stringify(studentAnswers),
+                        asr_engine: 'instructional',
+                        sesskey: config.sesskey || ''
+                    });
+
+                    await fetch(submitUrl, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                        body: params
+                    });
+
+                    if (statusText) statusText.textContent = "Instructional Assessment submitted successfully! Reloading...";
+                    setTimeout(() => window.location.reload(), 1200);
+
+                } catch (e) {
+                    console.error("Evaluation submission error:", e);
+                    if (statusText) statusText.textContent = "Error submitting evaluation: " + e.message;
+                    submitBtn.disabled = false;
+                }
+            });
+        }
+    }
+
+    return {
+        init: init,
+        playWord: function(word) {
+            safePlayWordAudio(word, "alloy");
+        },
+        playSteps: function() {
+            playProgressiveSoundOut(isolatedBlendingSteps, "alloy");
+        },
+        matchSyllable: matchSyllable,
+        matchWholeWord: matchWholeWord,
+        evaluatePronunciation: evaluatePronunciation
+    };
+})();
+
+
+and this is my python env service.py
+
+import os
+import re
+import json
+import base64
+import asyncio
+import jellyfish
+from aiohttp import web
+import aiohttp_cors
+from openai import AsyncOpenAI
+
+try:
+    import pyphen
+    PYPHEN_DIC = pyphen.Pyphen(lang='en_US')
+except Exception:
+    PYPHEN_DIC = None
+
+try:
+    import eng_to_ipa as ipa_lib
+except Exception:
+    ipa_lib = None
+
+CACHE_FILE_PATH = os.path.join(os.path.dirname(__file__), "phonetic_cache.json")
+PHONETIC_CACHE = {}
+
+def load_cache():
+    global PHONETIC_CACHE
+    if os.path.isfile(CACHE_FILE_PATH):
+        try:
+            with open(CACHE_FILE_PATH, "r", encoding="utf-8") as f:
+                PHONETIC_CACHE = json.load(f)
+        except Exception as e:
+            print("Notice: Starting with fresh phonetic cache:", e)
+            PHONETIC_CACHE = {}
+
+def save_cache():
+    try:
+        with open(CACHE_FILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(PHONETIC_CACHE, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print("Warning: Could not save phonetic cache:", e)
+
+load_cache()
+
+def load_env_files():
+    """
+    Search common .env locations and set environment variables if missing.
+    """
+    candidates = [
+        os.path.join(os.path.dirname(__file__), ".env"),
+        "/var/www/andrew/moodle/moodle/mod/readingassessment/venv_asr/.env",
+        "/var/www/andrew/.env",
+        os.path.expanduser("~/.env")
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            parts = line.split("=", 1)
+                            k = parts[0].strip().replace("export ", "")
+                            v = parts[1].strip().strip("'\"")
+                            if k and k not in os.environ:
+                                os.environ[k] = v
+            except Exception:
+                pass
+
+load_env_files()
+
+def get_openai_client():
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        return None
+    return AsyncOpenAI(api_key=api_key)
+
+async def index(request):
+    return web.FileResponse("./static/index.html") if os.path.exists("./static/index.html") else web.Response(text="Dynamic NLP ASR & Instructional Reader Service Running")
+
+async def create_session(request):
+    """
+    Create an ephemeral client secret for browser-based WebRTC streaming to OpenAI Realtime API.
+    """
+    client = get_openai_client()
+    if not client:
+        return web.json_response({
+            "error": "OPENAI_API_KEY environment variable is missing. Please set OPENAI_API_KEY in Moodle Site Admin or .env file."
+        }, status=500)
+
+    try:
+        session = await client.realtime.client_secrets.create(
+            session={
+                "type": "transcription",
+                "audio": {
+                    "input": {
+                        "transcription": {
+                            "model": "gpt-live-transcribe",
+                            "language": "en",
+                            "delay": "minimal",
+                        },
+                        "turn_detection": None,
+                    }
+                },
+            }
+        )
+        return web.json_response({
+            "client_secret": session.value,
+        })
+    except Exception as e:
+        return web.json_response({
+            "error": f"OpenAI Realtime API error: {str(e)}"
+        }, status=500)
+
+def normalize_text(text: str) -> list[str]:
+    """
+    Clean text by lowercasing and stripping punctuation/whitespace.
+    """
+    if not text:
+        return []
+    cleaned = re.sub(r'[^\w\s]', '', text.lower())
+    return cleaned.split()
+
+def count_syllables(word: str) -> int:
+    """
+    Estimate English syllable count dynamically using pyphen and morphology.
+    """
+    clean_w = re.sub(r'[^a-z]', '', word.lower())
+    if not clean_w:
+        return 0
+    if len(clean_w) <= 3:
+        return 1
+
+    monosyllables = {
+        "edge", "dodge", "bridge", "badge", "judge", "school", "friend", "thought",
+        "through", "night", "knight", "straight", "bright", "caught", "brought",
+        "spring", "string", "strong", "scream", "please", "house", "mouse", "ground"
+    }
+    if clean_w in monosyllables:
+        return 1
+
+    if PYPHEN_DIC:
+        try:
+            hyphenated = PYPHEN_DIC.inserted(clean_w)
+            parts = hyphenated.split('-')
+            if len(parts) > 1:
+                return len(parts)
+        except Exception:
+            pass
+
+    w = re.sub(r'e$', '', clean_w)
+    if not re.search(r'(ted|ded)$', clean_w):
+        w = re.sub(r'ed$', '', w)
+    w = re.sub(r'es$', '', w)
+
+    vowel_groups = re.findall(r'[aeiouy]+', w)
+    count = len(vowel_groups)
+    return max(1, count)
+
+def ipa_to_google_respelling(ipa_str: str, word: str) -> str:
+    """
+    Converts standard IPA transcription into readable Google-style phonetic respelling.
+    """
+    if not ipa_str or ipa_str == f"/{word}/":
+        return word
+
+    s = ipa_str.strip('/').strip()
+    
+    mapping = [
+        ('tʃ', 'ch'), ('ʧ', 'ch'), ('dʒ', 'j'), ('ʤ', 'j'),
+        ('θ', 'th'), ('ð', 'th'), ('ʃ', 'sh'), ('ʒ', 'zh'),
+        ('ŋ', 'ng'), ('j', 'y'),
+        ('eɪ', 'ay'), ('aɪ', 'eye'), ('ɔɪ', 'oy'),
+        ('oʊ', 'oh'), ('aʊ', 'ow'),
+        ('iː', 'ee'), ('uː', 'oo'),
+        ('ʊ', 'uu'), ('ɪ', 'i'), ('ɛ', 'e'), ('æ', 'a'),
+        ('ɑː', 'ah'), ('ɑ', 'ah'), ('ɒ', 'o'), ('ɔː', 'aw'),
+        ('ɔ', 'aw'), ('ʌ', 'u'), ('ə', 'uh'),
+        ('ər', 'er'), ('ɛər', 'air'), ('ɪər', 'eer')
+    ]
+    
+    res = s
+    for k, v in mapping:
+        res = res.replace(k, v)
+        
+    res = res.replace('ˈ', '').replace('ˌ', '').replace('.', '-')
+    return res
+
+def generate_dynamic_phonetic_guide(clean_w: str) -> dict:
+    """
+    Dynamic Third-Party NLP Pipeline (pyphen + eng_to_ipa + CMUDict).
+    """
+    # 1. Monosyllabic check
+    syl_count = count_syllables(clean_w)
+    is_mono = (syl_count <= 1)
+
+    # 2. Syllable Segmentation via pyphen
+    if is_mono:
+        syllables = [clean_w]
+    elif PYPHEN_DIC:
+        try:
+            hyphenated = PYPHEN_DIC.inserted(clean_w)
+            parts = hyphenated.split('-') if hyphenated else [clean_w]
+            # Refine multi-syllable segmentation
+            if len(parts) == 1 and len(clean_w) > 4:
+                pattern = r'[^aeiouy]+[aeiouy]+(?:[^aeiouy]+(?![aeiouy]))?'
+                matches = re.findall(pattern, clean_w)
+                syllables = matches if (matches and "".join(matches) == clean_w) else [clean_w]
+            else:
+                syllables = parts
+        except Exception:
+            syllables = [clean_w]
+    else:
+        pattern = r'[^aeiouy]+[aeiouy]+(?:[^aeiouy]+(?![aeiouy]))?'
+        matches = re.findall(pattern, clean_w)
+        syllables = matches if (matches and "".join(matches) == clean_w) else [clean_w]
+
+    # 3. IPA Transcription via eng_to_ipa (CMUDict)
+    ipa_str = f"/{clean_w}/"
+    if ipa_lib:
+        try:
+            converted = ipa_lib.convert(clean_w)
+            if converted and not converted.endswith("*"):
+                ipa_str = f"/{converted}/"
+        except Exception:
+            pass
+
+    # 4. Google-Style Phonetic Respelling
+    respelling = ipa_to_google_respelling(ipa_str, clean_w)
+    if respelling == clean_w and len(syllables) > 1:
+        respelling = "-".join(syllables)
+
+    # 5. Progressive Cumulative Blending Steps
+    blending_steps = []
+    if is_mono:
+        blending_steps = [{"label": "Whole Word", "formula": f"[ {clean_w} ]", "spoken_target": clean_w}]
+    else:
+        accum = ""
+        for idx, s in enumerate(syllables):
+            accum += s
+            if idx == 0:
+                blending_steps.append({"label": f"Step {idx+1}", "formula": f"[ {s} ]", "spoken_target": s})
+            else:
+                prev_chunk = "".join(syllables[:idx])
+                blending_steps.append({"label": f"Step {idx+1}", "formula": f"[ {prev_chunk} ] + [ {s} ] ➔ \"{accum}\"", "spoken_target": accum})
+
+    # 6. Automatic Phonetic Aliases for Speech Recognition
+    aliases = {clean_w: [clean_w]}
+    for s in syllables:
+        aliases[s] = [s]
+
+    return {
+        "word": clean_w,
+        "respelling": respelling,
+        "ipa": ipa_str,
+        "syllables": syllables,
+        "blending_steps": blending_steps,
+        "is_monosyllable": is_mono,
+        "aliases": aliases
+    }
+
+async def get_or_create_phonetic_guide(word: str) -> dict:
+    """
+    Multi-Tier Phonetic Lookup with Persistent LRU Cache.
+    """
+    clean_w = re.sub(r'[^\w]', '', word.lower())
+    if not clean_w:
+        return {
+            "word": "",
+            "respelling": "",
+            "ipa": "",
+            "syllables": [],
+            "blending_steps": [],
+            "is_monosyllable": True,
+            "aliases": {}
+        }
+
+    # 1. Check persistent on-disk / memory cache
+    if clean_w in PHONETIC_CACHE:
+        return PHONETIC_CACHE[clean_w]
+
+    # 2. Dynamic generation using pyphen & eng_to_ipa NLP pipeline
+    guide = generate_dynamic_phonetic_guide(clean_w)
+
+    # 3. Store in persistent cache
+    PHONETIC_CACHE[clean_w] = guide
+    save_cache()
+
+    return guide
+
+def compute_phonetic_similarity(w1: str, w2: str) -> float:
+    """
+    Hybrid Phonetic Similarity Algorithm:
+    Combines Jaro-Winkler string similarity (60%) with Metaphone phonetic root similarity (40%).
+    Also handles concatenated spaced syllable utterances (e.g., 'wan der ed' matching 'wandered').
+    """
+    if not w1 or not w2:
+        return 0.0
+    
+    w1_clean = w1.replace(" ", "").replace("-", "")
+    w2_clean = w2.replace(" ", "").replace("-", "")
+
+    if w1_clean == w2_clean:
+        return 1.0
+
+    str_sim = max(
+        jellyfish.jaro_winkler_similarity(w1, w2),
+        jellyfish.jaro_winkler_similarity(w1_clean, w2_clean)
+    )
+
+    m1 = jellyfish.metaphone(w1_clean)
+    m2 = jellyfish.metaphone(w2_clean)
+
+    if m1 and m2:
+        if m1 == m2:
+            meta_sim = 1.0
+        else:
+            meta_sim = jellyfish.jaro_winkler_similarity(m1, m2)
+        composite = (str_sim * 0.6) + (meta_sim * 0.4)
+        return round(min(1.0, max(0.0, composite)), 4)
+
+    return round(str_sim, 4)
+
+def align_and_score(expected_text: str, spoken_text: str):
+    """
+    Align target passage tokens with spoken transcript tokens using Hybrid Jaro-Winkler + Metaphone similarity.
+    Formula: Reading accuracy = (Words - Miscues) / Words * 100
+    3-Tier Classification:
+    - Green (Good): similarity >= 0.90
+    - Yellow (Slight Improvement): 0.75 <= similarity < 0.90
+    - Red (Miscue / Poor): similarity < 0.75
+    """
+    expected_words = normalize_text(expected_text)
+    spoken_words = normalize_text(spoken_text)
+
+    if not expected_words:
+        return {
+            "total_words": 0,
+            "good_count": 0,
+            "improvement_count": 0,
+            "miscue_count": 0,
+            "accuracy_score": 100.0,
+            "word_feedback": []
+        }
+
+    word_feedback = []
+    good_count = 0
+    improvement_count = 0
+    miscue_count = 0
+
+    spoken_index = 0
+    spoken_len = len(spoken_words)
+
+    for exp_word in expected_words:
+        best_sim = 0.0
+        best_match_idx = -1
+
+        window_end = min(spoken_index + 4, spoken_len)
+        for idx in range(spoken_index, window_end):
+            spk_word = spoken_words[idx]
+            sim = compute_phonetic_similarity(exp_word, spk_word)
+            if sim > best_sim:
+                best_sim = sim
+                best_match_idx = idx
+
+        if best_match_idx != -1:
+            matched_spoken_word = spoken_words[best_match_idx]
+            if best_sim >= 0.90:
+                status = "good"  # Green
+                good_count += 1
+                spoken_index = best_match_idx + 1
+            elif best_sim >= 0.75:
+                status = "improvement"  # Yellow
+                improvement_count += 1
+                spoken_index = best_match_idx + 1
+            else:
+                status = "miscue"  # Red
+                miscue_count += 1
+        else:
+            status = "miscue"  # Red
+            best_sim = 0.0
+            matched_spoken_word = ""
+            miscue_count += 1
+
+        word_feedback.append({
+            "word": exp_word,
+            "status": status,
+            "similarity": round(best_sim, 4),
+            "spoken": matched_spoken_word
+        })
+
+    total_words = len(expected_words)
+    # Reading accuracy = (Words – Miscues) ÷ Words × 100
+    accuracy = round(max(0.0, ((total_words - miscue_count) / total_words) * 100.0), 2) if total_words > 0 else 100.0
+
+    return {
+        "total_words": total_words,
+        "good_count": good_count,
+        "improvement_count": improvement_count,
+        "miscue_count": miscue_count,
+        "accuracy_score": accuracy,
+        "word_feedback": word_feedback
+    }
+
+async def evaluate(request):
+    """
+    Evaluate student reading attempt & comprehension questions.
+    """
+    try:
+        data = await request.json()
+        passage = data.get("passage", "")
+        transcript = data.get("transcript", "")
+        student_answers = data.get("answers", [])
+        correct_answers = data.get("correct_answers", [])
+
+        reading_res = align_and_score(passage, transcript)
+        accuracy_score = reading_res["accuracy_score"]
+
+        total_questions = len(correct_answers)
+        correct_q_count = 0
+        answers_eval = []
+
+        for i in range(total_questions):
+            ans = student_answers[i] if i < len(student_answers) else None
+            c_ans = correct_answers[i]
+            is_correct = (ans is not None and int(ans) == int(c_ans))
+            if is_correct:
+                correct_q_count += 1
+            answers_eval.append({
+                "question_index": i,
+                "student_answer": ans,
+                "correct_answer": c_ans,
+                "is_correct": is_correct
+            })
+
+        comprehension_score = round((correct_q_count / total_questions) * 100.0, 2) if total_questions > 0 else 100.0
+        composite_grade = round((accuracy_score * 0.6) + (comprehension_score * 0.4), 2)
+
+        reading_time = data.get("reading_time", 0)
+        reading_speed = data.get("reading_speed", 0.0)
+
+        response_payload = {
+            "accuracy_score": accuracy_score,
+            "comprehension_score": comprehension_score,
+            "final_grade": composite_grade,
+            "reading_time": reading_time,
+            "reading_speed": reading_speed,
+            "total_words": reading_res["total_words"],
+            "good_count": reading_res["good_count"],
+            "improvement_count": reading_res["improvement_count"],
+            "miscue_count": reading_res["miscue_count"],
+            "word_feedback": reading_res["word_feedback"],
+            "answers_evaluated": answers_eval,
+            "transcript_received": transcript
+        }
+
+        return web.json_response(response_payload)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
+
+async def evaluate_instructional(request):
+    """
+    Dedicated evaluation endpoint for Instructional Readers, strictly calculating:
+    Reading accuracy = (Words - Miscues) / Words * 100
+    """
+    try:
+        data = await request.json()
+        passage = data.get("passage", "")
+        transcript = data.get("transcript", "")
+        client_miscues = data.get("miscue_count", 0)
+        client_word_feedback = data.get("word_feedback", [])
+        reading_time = data.get("reading_time", 0)
+        reading_speed = data.get("reading_speed", 0.0)
+        student_answers = data.get("answers", [])
+        correct_answers = data.get("correct_answers", [])
+
+        expected_tokens = normalize_text(passage)
+        total_words = len(expected_tokens)
+
+        # Total miscues from actual guided reading session
+        total_miscues = min(total_words, max(0, int(client_miscues)))
+        
+        # Formula: Reading accuracy = (Words – Miscues) ÷ Words × 100
+        good_words = max(0, total_words - total_miscues)
+        accuracy_score = round((good_words / total_words) * 100.0, 2) if total_words > 0 else 100.0
+
+        # Construct or preserve accurate word feedback
+        if client_word_feedback and isinstance(client_word_feedback, list) and len(client_word_feedback) == total_words:
+            final_word_feedback = client_word_feedback
+        else:
+            # Construct deterministic word feedback
+            final_word_feedback = []
+            remaining_miscues = total_miscues
+            for w in expected_tokens:
+                if remaining_miscues > 0:
+                    status = "miscue"
+                    remaining_miscues -= 1
+                else:
+                    status = "good"
+                final_word_feedback.append({
+                    "word": w,
+                    "status": status,
+                    "similarity": 1.0 if status == "good" else 0.0,
+                    "spoken": w if status == "good" else ""
+                })
+
+        total_questions = len(correct_answers)
+        correct_q_count = 0
+        answers_eval = []
+
+        for i in range(total_questions):
+            ans = student_answers[i] if i < len(student_answers) else None
+            c_ans = correct_answers[i]
+            is_correct = (ans is not None and int(ans) == int(c_ans))
+            if is_correct:
+                correct_q_count += 1
+            answers_eval.append({
+                "question_index": i,
+                "student_answer": ans,
+                "correct_answer": c_ans,
+                "is_correct": is_correct
+            })
+
+        comprehension_score = round((correct_q_count / total_questions) * 100.0, 2) if total_questions > 0 else 100.0
+        composite_grade = round((accuracy_score * 0.6) + (comprehension_score * 0.4), 2)
+
+        return web.json_response({
+            "accuracy_score": accuracy_score,
+            "comprehension_score": comprehension_score,
+            "final_grade": composite_grade,
+            "reading_time": reading_time,
+            "reading_speed": reading_speed,
+            "total_words": total_words,
+            "miscue_count": total_miscues,
+            "good_count": good_words,
+            "word_feedback": final_word_feedback,
+            "answers_evaluated": answers_eval,
+            "transcript_received": transcript
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
+
+async def breakdown_word(request):
+    """
+    Dynamic breakdown of any target word with multi-tier NLP & AI generation.
+    """
+    try:
+        data = await request.json()
+        word = data.get("word", "")
+        guide = await get_or_create_phonetic_guide(word)
+        return web.json_response(guide)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
+
+async def tts_words(request):
+    """
+    Generate word/phoneme-level audio pronunciations via OpenAI TTS API.
+    Supports OpenAI instructions (personality steering) and speed control.
+    """
+    client = get_openai_client()
+    if not client:
+        return web.json_response({"audio_map": {}})
+
+    try:
+        data = await request.json()
+        words = data.get("words", [])
+        voice = data.get("voice", "alloy")
+        instructions = data.get("instructions") or data.get("personality") or ""
+        speed = float(data.get("speed", 0.88))
+        if speed < 0.25 or speed > 4.0:
+            speed = 0.88
+
+        audio_map = {}
+        unique_words = list(dict.fromkeys([re.sub(r'[^\w]', '', w.lower()) for w in words if w.strip()]))[:60]
+        tts_models = ["gpt-4o-mini-tts", "tts-1-hd", "tts-1-hd-1106", "tts-1"]
+
+        for w in unique_words:
+            if not w:
+                continue
+            for model_name in tts_models:
+                try:
+                    params = {
+                        "model": model_name,
+                        "voice": voice,
+                        "input": w,
+                        "speed": speed,
+                        "response_format": "mp3"
+                    }
+                    if "gpt-4o" in model_name and instructions:
+                        params["instructions"] = instructions
+
+                    response = await client.audio.speech.create(**params)
+                    audio_bytes = response.content
+                    b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+                    audio_map[w] = f"data:audio/mp3;base64,{b64_audio}"
+                    break
+                except Exception as ex:
+                    pass
+
+        return web.json_response({"audio_map": audio_map})
+    except Exception as e:
+        return web.json_response({"audio_map": {}, "notice": str(e)}, status=200)
+
+async def transcribe(request):
+    """
+    Fallback REST transcription endpoint using OpenAI Whisper API.
+    """
+    client = get_openai_client()
+    if not client:
+        return web.json_response({"error": "OPENAI_API_KEY environment variable is missing"}, status=500)
+
+    try:
+        reader = await request.multipart()
+        field = await reader.next()
+        if field.name != 'audio':
+            return web.json_response({"error": "Expected audio field"}, status=400)
+
+        filename = field.filename or "audio.webm"
+        file_bytes = await field.read()
+
+        transcript_res = await client.audio.transcriptions.create(
+            model="whisper-1",
+            file=(filename, file_bytes),
+            language="en"
+        )
+        return web.json_response({"transcript": transcript_res.text})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+LETTER_PHONEMES = {
+    "a": ["a", "ah", "ay", "ae", "eh", "uh", "apple", "ant", "at", "ey"],
+    "e": ["e", "eh", "ee", "egg", "elephant", "ed", "echo"],
+    "i": ["i", "ih", "eye", "ee", "it", "in", "igloo", "ice"],
+    "o": ["o", "ah", "oh", "aw", "octopus", "on", "off", "orange"],
+    "u": ["u", "uh", "yu", "oo", "umbrella", "up", "under", "us"],
+    "b": ["b", "ba", "beh", "bee", "buh", "bat", "ball", "boy"],
+    "c": ["c", "k", "ka", "keh", "kuh", "see", "cat", "car", "cup"],
+    "d": ["d", "da", "deh", "duh", "dee", "dog", "duck", "door"],
+    "f": ["f", "ef", "fa", "feh", "fuh", "fish", "fox", "fan"],
+    "g": ["g", "ga", "geh", "guh", "gee", "goat", "go", "girl"],
+    "h": ["h", "ha", "heh", "huh", "aitch", "hat", "hen", "hot"],
+    "j": ["j", "ja", "jeh", "juh", "jay", "jam", "jar", "jug"],
+    "k": ["k", "ka", "keh", "kuh", "kay", "kite", "king", "key"],
+    "l": ["l", "el", "la", "leh", "luh", "lion", "leg", "log"],
+    "m": ["m", "em", "ma", "meh", "muh", "moon", "monkey", "man"],
+    "n": ["n", "en", "na", "neh", "nuh", "nut", "nest", "net"],
+    "p": ["p", "pa", "peh", "puh", "pee", "pig", "pen", "pot"],
+    "q": ["q", "qu", "kwa", "cue", "queen", "quiet", "quilt"],
+    "r": ["r", "ar", "er", "ra", "reh", "ruh", "ring", "rat", "red"],
+    "s": ["s", "es", "sa", "seh", "suh", "sun", "snake", "star"],
+    "t": ["t", "ta", "teh", "tuh", "tee", "top", "tent", "tree"],
+    "v": ["v", "va", "veh", "vuh", "vee", "van", "vase", "vest"],
+    "w": ["w", "wa", "weh", "wuh", "double u", "win", "web", "water"],
+    "x": ["x", "ks", "ex", "box", "fox", "xray", "six"],
+    "y": ["y", "ya", "yeh", "yuh", "why", "yellow", "yo", "yes"],
+    "z": ["z", "za", "zeh", "zuh", "zee", "zed", "zebra", "zoo", "zip"],
+    "sh": ["sh", "esh", "sha", "sheh", "shuh", "ship", "shoe", "fish"],
+    "ch": ["ch", "cha", "cheh", "chuh", "chair", "chin", "chip"],
+    "th": ["th", "the", "tha", "theh", "thuh", "thumb", "think", "three"]
+}
+
+async def phonics_letter_eval(request):
+    """
+    Evaluates student articulation of individual letters / phonemes for emergent non-readers.
+    """
+    try:
+        data = await request.json()
+        target_letter = (data.get("letter") or "").strip().lower()
+        spoken_transcript = (data.get("transcript") or "").strip().lower()
+
+        if not target_letter:
+            return web.json_response({"matched": False, "reason": "No target letter provided"})
+
+        spoken_tokens = [re.sub(r"[^\w]", "", t) for t in spoken_transcript.split() if t]
+        allowed_phonemes = LETTER_PHONEMES.get(target_letter, [target_letter])
+
+        matched = False
+        matched_token = ""
+
+        # Direct token match against phoneme table
+        for token in spoken_tokens:
+            if token in allowed_phonemes or token == target_letter:
+                matched = True
+                matched_token = token
+                break
+
+        # Fuzzy phonetic similarity fallback
+        if not matched:
+            for token in spoken_tokens:
+                for ph in allowed_phonemes:
+                    sim = jellyfish.jaro_winkler_similarity(token, ph)
+                    if sim >= 0.82:
+                        matched = True
+                        matched_token = token
+                        break
+                if matched:
+                    break
+
+        return web.json_response({
+            "matched": matched,
+            "target": target_letter,
+            "spoken": spoken_transcript,
+            "matched_token": matched_token
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def tts_phoneme_guide(request):
+    """
+    Generates OpenAI TTS audio guide for letter sounds or letter-by-letter blending words.
+    """
+    client = get_openai_client()
+    if not client:
+        return web.json_response({"audio": None, "fallback": "speech_synthesis"}, status=200)
+
+    try:
+        data = await request.json()
+        text_to_speak = data.get("text", "")
+        voice = data.get("voice", "alloy")
+        instructions = data.get("instructions") or data.get("personality") or ""
+        speed = float(data.get("speed", 0.88))
+        if speed < 0.25 or speed > 4.0:
+            speed = 0.88
+
+        if not text_to_speak:
+            return web.json_response({"error": "No text provided"}, status=400)
+
+        tts_models = ["gpt-4o-mini-tts", "tts-1-hd", "tts-1-hd-1106", "tts-1"]
+        audio_b64 = None
+
+        for model_name in tts_models:
+            try:
+                params = {
+                    "model": model_name,
+                    "voice": voice,
+                    "input": text_to_speak,
+                    "speed": speed,
+                    "response_format": "mp3"
+                }
+                if "gpt-4o" in model_name and instructions:
+                    params["instructions"] = instructions
+
+                response = await client.audio.speech.create(**params)
+                audio_bytes = response.content
+                audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+                break
+            except Exception as ex:
+                pass
+
+        if audio_b64:
+            return web.json_response({"audio": f"data:audio/mp3;base64,{audio_b64}"})
+        else:
+            return web.json_response({"audio": None, "fallback": "speech_synthesis"}, status=200)
+    except Exception as e:
+        return web.json_response({"audio": None, "fallback": "speech_synthesis", "reason": str(e)}, status=200)
+
+COMMON_DIGRAPHS = ["sh", "ch", "th", "wh", "ph", "ck", "qu", "ng", "ea", "ee", "oo", "ai", "oa", "ar", "or", "er", "ir", "ur"]
+
+def segment_word_into_phonemes(word):
+    """
+    Segment a simple word into its constituent phonemes/digraphs for progressive successive blending.
+    e.g. 'fish' -> ['f', 'i', 'sh']
+         'cat'  -> ['c', 'a', 't']
+         'sun'  -> ['s', 'u', 'n']
+    """
+    word = word.lower().strip()
+    phonemes = []
+    i = 0
+    while i < len(word):
+        matched = False
+        for dg in COMMON_DIGRAPHS:
+            if word[i:].startswith(dg):
+                phonemes.append(dg)
+                i += len(dg)
+                matched = True
+                break
+        if not matched:
+            phonemes.append(word[i])
+            i += 1
+    return phonemes
+
+def generate_progressive_steps(word):
+    """
+    Generates successive progressive phoneme blending steps.
+    e.g. for 'fish':
+      Step 1: /f/ (sound)
+      Step 2: /f/ + /i/ = /fi/
+      Step 3: /fi/ + /sh/ = /fish/
+      Step 4: Say the whole word naturally: fish!
+    """
+    word = word.lower().strip()
+    phonemes = segment_word_into_phonemes(word)
+    steps = []
+
+    if not phonemes:
+        return []
+
+    # Step 1: First Sound
+    first_p = phonemes[0]
+    steps.append({
+        "step_num": 1,
+        "type": "first_sound",
+        "accumulated": first_p,
+        "phoneme": f"/{first_p}/",
+        "formula": f"/{first_p}/",
+        "prompt": f"Listen to the first sound: /{first_p}/",
+        "audio_text": f"Listen: /{first_p}/."
+    })
+
+    # Successive additions
+    accum = first_p
+    for idx in range(1, len(phonemes)):
+        next_p = phonemes[idx]
+        prev_accum = accum
+        accum += next_p
+
+        steps.append({
+            "step_num": idx + 1,
+            "type": "blend_step",
+            "prev_chunk": prev_accum,
+            "next_sound": next_p,
+            "accumulated": accum,
+            "formula": f"/{prev_accum}/ + /{next_p}/ → /{accum}/",
+            "prompt": f"Connect the sounds: /{prev_accum}/ + /{next_p}/ → /{accum}/",
+            "audio_text": f"/{prev_accum}/ plus /{next_p}/... /{accum}/."
+        })
+
+    # Final Whole Word
+    steps.append({
+        "step_num": len(steps) + 1,
+        "type": "whole_word",
+        "accumulated": word,
+        "formula": f"Blend it all together: {word.upper()}!",
+        "prompt": f"Now blend all the sounds together into one word: {word.upper()}!",
+        "audio_text": f"Now blend it all together... {word}!"
+    })
+
+    return steps
+
+async def progressive_blend_steps(request):
+    """
+    API endpoint returning progressive continuous phoneme blending steps for any word.
+    """
+    try:
+        data = await request.json()
+        word = (data.get("word") or "").strip().lower()
+        if not word:
+            return web.json_response({"error": "No word provided"}, status=400)
+
+        steps = generate_progressive_steps(word)
+        return web.json_response({
+            "word": word,
+            "phonemes": segment_word_into_phonemes(word),
+            "steps": steps
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def phoneme_evaluate(request):
+    """
+    Phoneme-Level Pronunciation and Continuous Blending Evaluation API.
+    Evaluates acoustic/phonetic properties, segmentation, pauses, and phoneme accuracy.
+    Enforces the rule: ASR Lexical Match != Pronunciation Mastery.
+    """
+    try:
+        data = await request.json()
+        target_word = (data.get("target_word") or data.get("word") or "").strip().lower()
+        spoken_transcript = (data.get("spoken_transcript") or data.get("spoken") or "").strip()
+        attempt_number = int(data.get("attempt_number") or 1)
+        
+        if not target_word:
+            return web.json_response({"error": "Missing target_word"}, status=400)
+            
+        clean_target = re.sub(r'[^\w]', '', target_word)
+        guide = await get_or_create_phonetic_guide(clean_target)
+        
+        phonemes = segment_word_into_phonemes(clean_target)
+        syllables = guide.get("syllables", [clean_target])
+        is_monosyllable = (len(syllables) <= 1)
+        ipa = guide.get("ipa", f"/{clean_target}/")
+        
+        spoken_clean = re.sub(r'[^\w\s\-.]', '', spoken_transcript.lower()).strip()
+        chunks = [c for c in re.split(r'[\s\-.]+', spoken_clean) if c]
+        joined_spoken = "".join(chunks)
+        
+        # 1. Exact continuous fluent match (single token, no segmentation)
+        if spoken_clean == clean_target or (len(chunks) == 1 and chunks[0] == clean_target):
+            return web.json_response({
+                "target_word": clean_target,
+                "phonemes": phonemes,
+                "syllables": syllables,
+                "continuous_form": ipa,
+                "spoken_transcript": spoken_transcript,
+                "lexical_match": True,
+                "phoneme_match": True,
+                "syllable_match": True,
+                "blending_score": 1.0,
+                "error_type": "CORRECT_FLUENT",
+                "mastery": True,
+                "coaching_required": False,
+                "feedback": f"Super! You pronounced '{clean_target}' smoothly!"
+            })
+            
+        # 2. Segmented correct word (ANTI-FALSE-POSITIVE: ASR lexical match != mastery)
+        # e.g., "gla-de", "gla de", "g l ay d", "gla...de"
+        joined_sim = compute_phonetic_similarity(clean_target, joined_spoken)
+        if len(chunks) > 1 and (joined_spoken == clean_target or joined_sim >= 0.85):
+            if attempt_number == 1:
+                feedback_msg = f"Almost! Let's blend it smoothly. Listen: {clean_target}."
+            elif attempt_number == 2:
+                feedback_msg = f"Good try. Keep the sounds connected: {ipa} ... {clean_target}. Try it smoothly."
+            else:
+                feedback_msg = f"Let's put the sounds together: {' + '.join(phonemes)} ➔ {clean_target}. Now say it as one smooth word."
+                
+            return web.json_response({
+                "target_word": clean_target,
+                "phonemes": phonemes,
+                "syllables": syllables,
+                "continuous_form": ipa,
+                "spoken_transcript": spoken_transcript,
+                "lexical_match": True,
+                "phoneme_match": True,
+                "syllable_match": False if is_monosyllable else (len(chunks) == len(syllables)),
+                "blending_score": 0.65,
+                "error_type": "CORRECT_NEEDS_SMOOTHING",
+                "mastery": False,
+                "coaching_required": True,
+                "feedback": feedback_msg
+            })
+
+        # 3. Phonetic Distance & Miscue Analysis
+        sim = compute_phonetic_similarity(clean_target, spoken_clean)
+        blending_score = round(sim, 2)
+        error_type = "UNRECOGNIZED"
+        feedback_msg = f"Listen closely: {clean_target}. Now your turn!"
+        
+        if len(joined_spoken) > len(clean_target) + 2:
+            error_type = "PHONEME_ADDITION"
+            feedback_msg = f"Keep the sound pure without extra syllables. Listen: {clean_target}."
+        elif len(joined_spoken) < len(clean_target) - 2 and sim > 0.50:
+            error_type = "PHONEME_DELETION"
+            feedback_msg = f"Don't miss the inner sounds. Listen: {clean_target}."
+        elif sim >= 0.75:
+            error_type = "PHONEME_SUBSTITUTION"
+            feedback_msg = f"Almost! Check the individual sounds. Listen: {clean_target}."
+        elif is_monosyllable and len(chunks) > 1:
+            error_type = "SYLLABLE_SEGMENTATION_ERROR"
+            feedback_msg = f"'{clean_target}' is one single sound. Say it together: {clean_target}."
+
+        return web.json_response({
+            "target_word": clean_target,
+            "phonemes": phonemes,
+            "syllables": syllables,
+            "continuous_form": ipa,
+            "spoken_transcript": spoken_transcript,
+            "lexical_match": False,
+            "phoneme_match": (sim >= 0.85),
+            "syllable_match": False,
+            "blending_score": blending_score,
+            "error_type": error_type,
+            "mastery": False,
+            "coaching_required": True,
+            "feedback": feedback_msg
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+def init_app():
+    app = web.Application()
+
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+        )
+    })
+
+    route_index = app.router.add_get("/", index)
+    route_session = app.router.add_post("/session", create_session)
+    route_eval = app.router.add_post("/evaluate", evaluate)
+    route_eval_inst = app.router.add_post("/evaluate_instructional", evaluate_instructional)
+    route_breakdown = app.router.add_post("/breakdown_word", breakdown_word)
+    route_tts = app.router.add_post("/tts_words", tts_words)
+    route_transcribe = app.router.add_post("/transcribe", transcribe)
+    route_phonics_eval = app.router.add_post("/phonics_letter_eval", phonics_letter_eval)
+    route_phonics_tts = app.router.add_post("/tts_phoneme_guide", tts_phoneme_guide)
+    route_prog_blend = app.router.add_post("/progressive_blend_steps", progressive_blend_steps)
+    route_phoneme_eval = app.router.add_post("/phoneme_evaluate", phoneme_evaluate)
+
+    if os.path.exists("./static"):
+        app.router.add_static("/static/", "./static/")
+
+    cors.add(route_index)
+    cors.add(route_session)
+    cors.add(route_eval)
+    cors.add(route_eval_inst)
+    cors.add(route_breakdown)
+    cors.add(route_tts)
+    cors.add(route_transcribe)
+    cors.add(route_phonics_eval)
+    cors.add(route_phonics_tts)
+    cors.add(route_prog_blend)
+    cors.add(route_phoneme_eval)
+
+    return app
+
+if __name__ == "__main__":
+    app = init_app()
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Starting Dynamic NLP Phonetic ASR Service on port {port}...")
+    web.run_app(app, host="0.0.0.0", port=port)
