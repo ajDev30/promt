@@ -1,0 +1,123 @@
+ Plan: True Phoneme Blending Assessment & Evidence Audit                                                                                                                                                                                                                                                                                             ## 1. Primary Audit Question & Technical Analysis                                                                                                                                                                                                                                                                                                     > **Audit Question**: Can the current implementation distinguish `glade` (/gleɪd/) from `gla-de` when the ASR transcript for both is simply normalized to `"glade"`?                                                                                                                                                                                  ### Honest Technical Answer:                                                                                                                                               **NO, not from normalized ASR text alone.**                                                                                                                                If the ASR engine (OpenAI Realtime WebRTC or Browser Web Speech) receives `"gla-de"` and internally normalizes the token stream into the single text string `"glade"`, any evaluator that receives only `spokenTranscript: "glade"` cannot mathematically prove whether the acoustic production was one continuous syllable (/gleɪd/) or two disjointed chunks (/gla/ + pause + /de/).
+                                                                                                                                                                           ### What Acoustic / Timing Information IS Currently Available in the Pipeline:                                                                                             1. **Delta Stream Arrival Timing**: In WebRTC streaming (`gpt-live-transcribe`), delta tokens arrive with timestamps. If multiple sub-word deltas arrive with a pause between them (e.g., `"gla"` followed $>350\text{ms}$ later by `"de"`), the client can detect internal inter-token pause gaps.
+2. **Audio Chunk Segmentation & Energy / VAD**: The browser WebAudio API (`AudioContext` / `MediaStreamAudioSourceNode` / `AnalyserNode`) and backend microservice can measure speech duration and silence intervals within single-word utterances.
+3. **Multi-Chunk Transcript Output**: If the ASR outputs spaces, hyphens, or multiple words (e.g., `"gla de"`, `"gla-de"`, `"g l ay d"`), lexical segmentation is explicitly detected.
+4. **When Only Final Transcript Text is Available**: The system has **TRANSCRIPT_ONLY** evidence and must be completely honest: **Lexical match does NOT equal Blending Mastery**.
+
+---
+
+## 2. The 3-Layer Evaluation Architecture
+
+```mermaid
+graph TD
+    A[Student Audio & Speech Stream] --> B[Layer 1: Lexical Recognition]
+    A --> C[Layer 2: Phoneme Accuracy]
+    A --> D[Layer 3: Blending / Temporal Fluency]
+
+    B -->|ASR Identified Word| E{Evaluate Evidence}
+    C -->|Detected Phoneme Sequence| E
+    D -->|Continuous vs Segmented Timing| E
+
+    E -->|Evidence: TRANSCRIPT_ONLY| F[Status: LEXICAL_MATCH_ONLY<br>Mastery: FALSE<br>Prompts Smooth Blending]
+    E -->|Evidence: ACOUSTIC_VERIFIED + Fluent| G[Status: CORRECT_FLUENT<br>Mastery: TRUE]
+    E -->|Evidence: Segmented / Paused| H[Status: CORRECT_NEEDS_SMOOTHING<br>Mastery: FALSE<br>Corrective Modeling]
+    E -->|Evidence: Miscue / Wrong Sound| I[Status: PHONEME_SUBSTITUTION / DELETION<br>Mastery: FALSE]
+```
+
+---
+## 3. Evaluator State Model & Evidence Levels
+
+The evaluator output will be refactored into an explicit, structured object:
+
+```javascript
+{
+    targetWord: "glade",
+    evidence: "TRANSCRIPT_ONLY" | "ACOUSTIC_VERIFIED" | "INTERMEDIATE_DELTA",
+
+    lexical: {
+        matched: true,
+        confidence: 0.98
+    },
+
+    phonemes: {
+        target: ["g", "l", "eɪ", "d"],
+        detected: ["g", "l", "eɪ", "d"] | null,
+        matched: true | false | null
+    },
+
+    syllables: {
+        targetCount: 1,
+        detectedCount: 1 | 2 | null,
+        matched: true | false | null
+    },
+
+    blending: {
+        verified: true | false,
+        score: 0.0 to 1.0 | null,
+        internalPauseDetected: true | false | null
+    },
+
+    status: "CORRECT_FLUENT"
+          | "LEXICAL_MATCH_ONLY"
+          | "CORRECT_NEEDS_SMOOTHING"
+          | "PHONEME_SUBSTITUTION"
+          | "PHONEME_DELETION"
+          | "PHONEME_ADDITION"
+          | "SYLLABLE_SEGMENTATION_ERROR"
+          | "UNRECOGNIZED",
+ mastery: boolean, // TRUE only when lexical.matched && (blending.verified || evidence is verified)
+    feedbackPrompt: string
+}
+```
+
+---
+
+## 4. Proposed Changes
+
+### Component 1: Client Evaluator (`mod/readingassessment/js/instructional.js`)
+
+#### [MODIFY] `js/instructional.js`
+1. **Refactor `evaluatePronunciation()`**:
+   - Separate Lexical match, Phoneme match, and Blending verification.
+   - For monosyllabic words (e.g. `glade` with 1 target syllable):
+     - If input contains any token separation (`"gla de"`, `"gla-de"`, `"g l ay d"`):
+       - `status = "CORRECT_NEEDS_SMOOTHING"`, `mastery = false`.
+     - If input is a single token (`"glade"`):
+       - In normal line reading: Advances line.
+       - In Word Isolation Mode: Requires acoustic/continuous verification before marking full mastery. If only transcript is present, marks `status = "LEXICAL_MATCH_ONLY"`, requiring the student to demonstrate smooth single-token vocalization.
+2. **Mastery Conservatism**:
+   - `matchWholeWord()`, `jaroWinkler()`, and `metaphone()` are strictly utilized for lexical similarity and phonetic root alignment. **None** of them can independently grant mastery without meeting the phoneme and blending criteria.
+                                                                                                                                                                           ---
+
+### Component 2: Python NLP & Phoneme Service (`venv_asr/service.py` & `templates_asr/service.py`)
+
+#### [MODIFY] `service.py`
+1. **Audit & Refactor `/phoneme_evaluate`**:
+   - Return detailed 3-tier object (`lexical`, `phonemes`, `syllables`, `blending`, `evidence`, `status`, `mastery`).
+   - Distinguish `TRANSCRIPT_ONLY` evidence from segmented transcript evidence.
+
+---
+
+## 5. Comprehensive Test Matrix (Target: `glade`)
+
+| Scenario | Input | ASR Transcript | Lexical | Phoneme Match | Syllables | Blending | Evaluator Status | Mastery |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **A** | "glade" | `"glade"` | `true` | `true` | 1 / 1 | `true` | `CORRECT_FLUENT` | **TRUE** |
+| **B** | "gla-de" | `"gla-de"` | `true` | `true` | 2 / 1 | `false` | `CORRECT_NEEDS_SMOOTHING` | **FALSE** |
+| **C** | "gla ... de" | `"gla de"` | `true` | `true` | 2 / 1 | `false` | `CORRECT_NEEDS_SMOOTHING` | **FALSE** |
+| **D** | "glate" | `"glate"` | `false` | `false` (/t/ $\neq$ /d/) | 1 / 1 | `false` | `PHONEME_SUBSTITUTION` | **FALSE** |
+| **E** | "gade" | `"gade"` | `false` | `false` (missing /l/) | 1 / 1 | `false` | `PHONEME_DELETION` | **FALSE** |
+| **F** | "glay-dee"| `"glay dee"` | `false` | `false` (+/i:/) | 2 / 1 | `false` | `PHONEME_ADDITION` | **FALSE** |
+
+---
+
+## 6. Verification Plan
+
+### Automated Tests
+1. **Node.js Test Suite**:
+   - Execute all 6 test scenarios (A through F) against `evaluatePronunciation()`.
+   - Verify that Scenarios B, C, D, E, and F evaluate to `mastery: false`.
+2. **Python Backend Test**:
+   - Verify `/phoneme_evaluate` returns the structured 3-layer response with evidence metadata.
+3. **Syntax Validation**:
+   - Run `node -c js/instructional.js` and `php -l`.
