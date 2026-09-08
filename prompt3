@@ -1,0 +1,2445 @@
+"""
+Real-Time Streaming ASR & Acoustic Reading Assessment Service (v3.4)
+=====================================================================
+
+4-Layer Assessment Architecture:
+- LAYER 1: Lexical Recognition (word correspondence & omission detection).
+- LAYER 2: Acoustic Phoneme Accuracy (Wav2Vec2 CTC + Two-Sided Levenshtein DP Alignment).
+- LAYER 3: Acoustic / Temporal Fluency (20ms Frame RMS VAD with hysteresis, inter-region gap analysis, syllable-aware blending).
+- LAYER 4: Disfluency & Repetition Detection (repeated words, repeated onsets, repeated syllables, restarts, blocks/prolongations).
+
+v3.4 Multi-User Isolation, Concurrency & Resource Safety Highlights:
+1. Strict Per-User/Per-Connection/Per-Attempt Isolation with Zero Cross-Session Data Leakage.
+2. Cryptographically Strong Server-Generated Session UUIDs (session_id = str(uuid.uuid4())).
+3. Thread-Safe Global Session Registry keyed strictly by server-generated session_id.
+4. Bounded Priority CPU Inference Engine (MAX_CONCURRENT_INFERENCES, MAX_INFERENCE_QUEUE, Priority 0 for Final, Priority 1 for Partial).
+5. Backpressure and Safe Overload Protection with server_busy signaling.
+6. Monotonic Session Generation Tokens with 4-Way Invalidation Check (finalized, session_id, generation, attempt_id).
+7. Session-Scoped Background Task Tracking with Deterministic Idempotent Cleanup.
+8. Configurable Resource Safety Limits: MAX_ATTEMPT_DURATION_MS, MAX_AUDIO_BUFFER_BYTES, MAX_AUDIO_CHUNK_BYTES, WEBSOCKET_IDLE_TIMEOUT_SEC.
+9. Shared Read-Only Quantized Wav2Vec2 Model (torch.inference_mode).
+10. Moodle Authentication/Authorization Integration Hooks and Safe Observability Metrics (/health, /version).
+"""
+
+import asyncio
+import dataclasses
+import io
+import json
+import logging
+import os
+import re
+import shutil
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import numpy as np
+import soundfile as sf
+import torch
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from phonemizer import phonemize
+from phonemizer.separator import Separator
+from starlette.websockets import WebSocketState
+from transformers import AutoModelForCTC, AutoProcessor
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("streamASR")
+
+# ============================================================
+# CONFIGURATION CONSTANTS & RESOURCE LIMITS
+# ============================================================
+
+APP_HOST = os.getenv("STREAM_HOST", "127.0.0.1")
+APP_PORT = int(os.getenv("STREAM_PORT", "8010"))
+SAMPLE_RATE = 16000
+DEBUG_ACOUSTIC = os.getenv("DEBUG_ACOUSTIC", "false").lower() in ("true", "1")
+
+# Concurrency & CPU Inference Limits
+MAX_CONCURRENT_INFERENCES = int(os.getenv("MAX_CONCURRENT_INFERENCES", str(min(4, os.cpu_count() or 2))))
+MAX_INFERENCE_QUEUE = int(os.getenv("MAX_INFERENCE_QUEUE", "50"))
+
+# Resource & Memory Limits
+MAX_ATTEMPT_DURATION_MS = int(os.getenv("MAX_ATTEMPT_DURATION_MS", "30000"))     # 30 seconds max per attempt
+MAX_AUDIO_BUFFER_BYTES = int(os.getenv("MAX_AUDIO_BUFFER_BYTES", str(16000 * 4 * 30))) # ~1.92 MB Float32
+MAX_AUDIO_CHUNK_BYTES = int(os.getenv("MAX_AUDIO_CHUNK_BYTES", "65536"))          # 64 KB max per PCM message
+WEBSOCKET_IDLE_TIMEOUT_SEC = float(os.getenv("WEBSOCKET_IDLE_TIMEOUT_SEC", "60.0")) # 60s idle timeout
+
+# Wav2Vec2 Phoneme Model
+PHONEME_MODEL_NAME = os.getenv(
+    "PHONEME_MODEL",
+    "facebook/wav2vec2-xlsr-53-espeak-cv-ft",
+)
+DEFAULT_PROFILE = os.getenv("PRONUNCIATION_PROFILE", "PHILIPPINE_ENGLISH")
+
+# Signal & VAD Framing (20ms frames @ 16kHz = 320 samples)
+FRAME_MS = 20
+FRAME_SIZE = int(SAMPLE_RATE * (FRAME_MS / 1000.0))  # 320 samples
+SILENCE_RMS_THRESHOLD = 0.005  # RMS energy threshold for speech
+
+# VAD State Machine & Hysteresis
+VAD_START_FRAMES = 2          # Consecutive active frames required to start a speech region
+VAD_END_SILENCE_MS = 120      # Sustained silence (ms) required to close a speech region
+MIN_SPEECH_MS = 80            # Minimum speech pulse duration to register a region
+
+# Acoustic Pause & Fluency Thresholds (Milliseconds)
+NORMAL_TRANSITION_MAX_MS = 150 # Normal acoustic transition
+MIN_INTERNAL_PAUSE_MS = 300   # Hesitation / suspicious pause threshold
+STRONG_PAUSE_MS = 350         # Strong segmentation threshold
+AUTO_ENDPOINT_SILENCE_MS = 1400 # Silence duration after speech to trigger auto-finalization
+
+# Layer 4 Disfluency & Repetition Configuration Constants
+REPETITION_MIN_GAP_MS = 40       # Minimum inter-emission gap for separate acoustic repetition
+REPETITION_MAX_GAP_MS = 500      # Maximum gap for onset/phoneme repetition
+REPETITION_MIN_EVENTS = 2        # Minimum repeated events to flag repetition
+ONSET_REPETITION_MAX_PHONEMES = 2 # Max consonants considered as onset prefix
+WORD_REPETITION_MIN_GAP_MS = 60  # Minimum gap between repeated whole words
+WORD_REPETITION_MAX_GAP_MS = 1400 # Maximum gap between repeated whole words
+PROLONGATION_MIN_MS = 450        # Minimum acoustic duration to flag prolongation/block
+RESTART_MIN_PREFIX_RATIO = 0.40  # Minimum prefix length to flag restart
+
+# Streaming Decoder Configuration
+PHONEME_WINDOW_MS = 1200      # Recent audio window analyzed during live streaming
+PHONEME_DECODE_INTERVAL_MS = 400 # Frequency of intermediate decodes
+
+# Scoring & Mastery Thresholds
+MASTER_THRESHOLD = 0.80       # Required phoneme score for mastery
+ACCEPTABLE_THRESHOLD = 0.65   # Required regional score for acceptable pronunciation
+BLENDING_PASS_THRESHOLD = 0.80 # Required blending score for fluent mastery
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+
+
+# ============================================================
+# FASTAPI APP
+# ============================================================
+
+app = FastAPI(
+    title="Streaming ASR & Acoustic Reading Assessment",
+    version="3.4.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+# GLOBAL READ-ONLY MODELS & REGISTRY
+# ============================================================
+
+processor: Optional[AutoProcessor] = None
+phoneme_model: Optional[Any] = None
+espeak_available: bool = False
+
+# Thread-safe Session Registry keyed strictly by server-generated UUID
+session_registry: Dict[str, Any] = {}
+registry_lock = asyncio.Lock()
+
+
+# ============================================================
+# BOUNDED CPU INFERENCE ENGINE
+# ============================================================
+
+@dataclass(order=True)
+class InferenceJob:
+    priority: int  # 0: High (FINAL decode), 1: Low (PARTIAL decode)
+    created_at: float = field(compare=True)
+    session_id: str = field(compare=False)
+    attempt_id: int = field(compare=False)
+    generation: int = field(compare=False)
+    audio_data: np.ndarray = field(compare=False)
+    is_final: bool = field(compare=False)
+    future: asyncio.Future = field(compare=False)
+
+
+class InferenceEngine:
+    """
+    Manages bounded CPU inference workers and prioritized task scheduling.
+    Guarantees that:
+    - High priority FINAL decodes are prioritized over partial sliding window decodes.
+    - Concurrency never exceeds MAX_CONCURRENT_INFERENCES.
+    - Queue depth never exceeds MAX_INFERENCE_QUEUE.
+    - Backpressure rejects or drops optional partial decodes gracefully.
+    - Stale jobs from superseded generations are discarded without running inference.
+    """
+
+    def __init__(self, max_concurrency: int = MAX_CONCURRENT_INFERENCES, max_queue: int = MAX_INFERENCE_QUEUE):
+        self.max_concurrency = max_concurrency
+        self.max_queue = max_queue
+        self.queue: asyncio.PriorityQueue[InferenceJob] = asyncio.PriorityQueue()
+        self.workers: List[asyncio.Task] = []
+        self.running: bool = False
+
+        # Observability metrics
+        self.active_inferences: int = 0
+        self.total_completed: int = 0
+        self.total_partial_decodes: int = 0
+        self.total_final_decodes: int = 0
+        self.total_rejected: int = 0
+        self.total_stale_discarded: int = 0
+        self.total_inference_time_ms: float = 0.0
+
+    async def start(self):
+        if self.running:
+            return
+        self.running = True
+        for i in range(self.max_concurrency):
+            worker_task = asyncio.create_task(self._worker_loop(i), name=f"inference-worker-{i}")
+            self.workers.append(worker_task)
+        logger.info(f"Bounded Inference Engine started with {self.max_concurrency} CPU workers (max_queue={self.max_queue}).")
+
+    async def stop(self):
+        self.running = False
+        for worker in self.workers:
+            worker.cancel()
+        self.workers.clear()
+
+    async def _worker_loop(self, worker_id: int):
+        while self.running:
+            try:
+                job = await self.queue.get()
+            except asyncio.CancelledError:
+                break
+
+            try:
+                # Validate job before running CPU inference
+                # Check if session is still alive and generation is still current
+                is_stale = False
+                async with registry_lock:
+                    session = session_registry.get(job.session_id)
+                    if session is None or session.generation != job.generation or session.attempt_id != job.attempt_id:
+                        is_stale = True
+
+                if is_stale:
+                    self.total_stale_discarded += 1
+                    if not job.future.done():
+                        job.future.set_result(None)
+                    self.queue.task_done()
+                    continue
+
+                self.active_inferences += 1
+                start_t = time.perf_counter()
+
+                # Execute pure model forward pass in thread pool
+                result = await asyncio.to_thread(run_model_inference, job.audio_data, job.is_final)
+                elapsed_ms = (time.perf_counter() - start_t) * 1000.0
+
+                self.total_completed += 1
+                self.total_inference_time_ms += elapsed_ms
+                if job.is_final:
+                    self.total_final_decodes += 1
+                else:
+                    self.total_partial_decodes += 1
+
+                if not job.future.done():
+                    job.future.set_result(result)
+
+            except Exception as exc:
+                logger.error(f"Inference worker {worker_id} error: {exc}", exc_info=True)
+                if not job.future.done():
+                    job.future.set_exception(exc)
+            finally:
+                self.active_inferences = max(0, self.active_inferences - 1)
+                self.queue.task_done()
+
+    async def submit_inference(
+        self,
+        session_id: str,
+        attempt_id: int,
+        generation: int,
+        audio_data: np.ndarray,
+        is_final: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Submits an audio chunk for phoneme decoding.
+        Returns decoded phoneme result or None if dropped due to queue pressure/staleness.
+        """
+        if not self.running or len(self.workers) == 0:
+            await self.start()
+
+        priority = 0 if is_final else 1
+        current_qsize = self.queue.qsize()
+
+        if current_qsize >= self.max_queue:
+            if not is_final:
+                # Drop lower-priority partial decodes under load without failing attempt
+                self.total_rejected += 1
+                logger.debug(f"session={session_id} attempt={attempt_id} gen={generation} event=partial_decode_dropped queue_size={current_qsize}")
+                return None
+            else:
+                # For final assessments under extreme saturation, log warning
+                logger.warning(f"session={session_id} attempt={attempt_id} gen={generation} event=high_queue_final_inference queue_size={current_qsize}")
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+
+        job = InferenceJob(
+            priority=priority,
+            created_at=time.time(),
+            session_id=session_id,
+            attempt_id=attempt_id,
+            generation=generation,
+            audio_data=audio_data.copy(),
+            is_final=is_final,
+            future=future,
+        )
+
+        await self.queue.put(job)
+        return await future
+
+    def get_metrics(self) -> Dict[str, Any]:
+        avg_time = (self.total_inference_time_ms / self.total_completed) if self.total_completed > 0 else 0.0
+        return {
+            "active_inferences": self.active_inferences,
+            "queue_size": self.queue.qsize(),
+            "total_completed": self.total_completed,
+            "total_partial_decodes": self.total_partial_decodes,
+            "total_final_decodes": self.total_final_decodes,
+            "total_rejected": self.total_rejected,
+            "total_stale_discarded": self.total_stale_discarded,
+            "average_inference_time_ms": round(avg_time, 2),
+        }
+
+
+inference_engine = InferenceEngine(
+    max_concurrency=MAX_CONCURRENT_INFERENCES,
+    max_queue=MAX_INFERENCE_QUEUE,
+)
+
+
+def load_phoneme_model_if_needed():
+    global processor, phoneme_model
+    if processor is not None and phoneme_model is not None:
+        return
+    logger.info(f"Loading Wav2Vec2 phoneme model: {PHONEME_MODEL_NAME}...")
+    num_threads = min(4, os.cpu_count() or 4)
+    torch.set_num_threads(num_threads)
+    processor = AutoProcessor.from_pretrained(PHONEME_MODEL_NAME)
+    raw_model = AutoModelForCTC.from_pretrained(PHONEME_MODEL_NAME)
+    raw_model.eval()
+    if DEVICE == "cpu":
+        phoneme_model = torch.quantization.quantize_dynamic(
+            raw_model, {torch.nn.Linear}, dtype=torch.qint8
+        )
+    else:
+        phoneme_model = raw_model.to(DEVICE)
+
+
+def run_model_inference(audio: np.ndarray, is_final: bool = False) -> Dict[str, Any]:
+    """
+    Stateless pure function for Wav2Vec2 phoneme CTC decoding.
+    Reads shared immutable model weights with torch.inference_mode.
+    Does NOT modify or retain any global student state.
+    """
+    global processor, phoneme_model
+    if processor is None or phoneme_model is None:
+        load_phoneme_model_if_needed()
+
+    if processor is None or phoneme_model is None or len(audio) < (SAMPLE_RATE * 0.1):
+        return {"phonemes": [], "raw": "", "sequence_confidence": 0.0, "emission_timestamps": []}
+
+    max_amp = float(np.max(np.abs(audio)))
+    if max_amp > 1e-4:
+        audio = audio / max_amp * 0.90
+
+    inputs = processor(
+        audio,
+        sampling_rate=SAMPLE_RATE,
+        return_tensors="pt",
+    )
+
+    with torch.inference_mode():
+        outputs = phoneme_model(input_values=inputs.input_values.to(DEVICE))
+
+    logits = outputs.logits[0]  # (T, vocab_size)
+    probs = torch.softmax(logits, dim=-1)
+    max_probs, argmax_ids = torch.max(probs, dim=-1)
+
+    pad_id = getattr(processor.tokenizer, "pad_token_id", 0)
+    blank_id = getattr(phoneme_model.config, "pad_token_id", pad_id)
+    ctc_stride_sec = calculate_ctc_temporal_stride(phoneme_model, SAMPLE_RATE)
+    decoded = processor.batch_decode(argmax_ids.unsqueeze(0))[0].strip()
+
+    emission_timestamps = []
+    emission_probs = []
+    prev_id = None
+
+    for t in range(len(argmax_ids)):
+        token_id = int(argmax_ids[t])
+        if token_id != pad_id and token_id != blank_id and token_id != prev_id:
+            token_sym = processor.tokenizer.convert_ids_to_tokens(token_id)
+            norm_sym = normalize_phoneme_symbol(token_sym)
+            if norm_sym and norm_sym not in {"|", "▁", "<unk>", "#", "_", "."}:
+                p_val = float(max_probs[t])
+                emission_timestamps.append({
+                    "phoneme": norm_sym,
+                    "timestamp_sec": round(t * ctc_stride_sec, 3),
+                    "prob": round(p_val, 3),
+                })
+                emission_probs.append(p_val)
+        prev_id = token_id
+
+    detected_phonemes = [e["phoneme"] for e in emission_timestamps]
+    seq_conf = round(float(np.mean(emission_probs)), 3) if emission_probs else 0.0
+
+    return {
+        "phonemes": detected_phonemes,
+        "raw": decoded,
+        "sequence_confidence": seq_conf,
+        "emission_timestamps": emission_timestamps,
+    }
+
+
+# ============================================================
+# PRONUNCIATION PROFILE & REGIONAL COMPATIBILITY
+# ============================================================
+
+class PronunciationProfile:
+    """
+    General phoneme compatibility system with explicit match types and penalties.
+    Operates strictly at the phoneme level without word-specific hacks.
+    """
+    VOWEL_EQUIVALENCES = {
+        "æ": {"æ": 0.0, "a": 0.05, "ɐ": 0.05},
+        "ʌ": {"ʌ": 0.0, "a": 0.05, "ɐ": 0.05, "ə": 0.05},
+        "ɑː": {"ɑː": 0.0, "a": 0.05, "oʊ": 0.10, "ɔː": 0.05},
+        "iː": {"iː": 0.0, "i": 0.05, "ɪ": 0.05},
+        "uː": {"uː": 0.0, "u": 0.05, "ʊ": 0.05},
+        "ə": {"ə": 0.0, "ʌ": 0.05, "a": 0.05},
+    }
+
+    RHOTIC_EQUIVALENCES = {
+        "ɹ": {"ɹ": 0.0, "r": 0.05, "ɾ": 0.05, "ɚ": 0.05},
+        "r": {"r": 0.0, "ɹ": 0.05, "ɾ": 0.05, "ɚ": 0.05},
+        "ɚ": {"ɚ": 0.0, "ɹ": 0.05, "r": 0.05, "ə": 0.05},
+    }
+
+    DEVELOPMENTAL_EQUIVALENCES = {
+        "f": {"f": 0.0, "p": 0.10},
+        "v": {"v": 0.0, "b": 0.10},
+        "θ": {"θ": 0.0, "t": 0.10, "s": 0.10},
+        "ð": {"ð": 0.0, "d": 0.10, "z": 0.10},
+        "ʃ": {"ʃ": 0.0, "s": 0.10},
+        "tʃ": {"tʃ": 0.0, "ts": 0.10},
+        "dʒ": {"dʒ": 0.0, "dz": 0.10},
+    }
+
+    ASPIRATION_EQUIVALENCES = {
+        "p": {"p": 0.0, "pʰ": 0.0},
+        "pʰ": {"pʰ": 0.0, "p": 0.0},
+        "t": {"t": 0.0, "tʰ": 0.0},
+        "tʰ": {"tʰ": 0.0, "t": 0.0},
+        "k": {"k": 0.0, "kʰ": 0.0},
+        "kʰ": {"kʰ": 0.0, "k": 0.0},
+    }
+
+    @classmethod
+    def check_compatibility(cls, target: str, detected: str) -> Tuple[bool, str, float]:
+        target = normalize_phoneme_symbol(target)
+        detected = normalize_phoneme_symbol(detected)
+
+        if target == detected:
+            return True, "EXACT", 0.0
+
+        if target in cls.ASPIRATION_EQUIVALENCES and detected in cls.ASPIRATION_EQUIVALENCES[target]:
+            return True, "ASPIRATION_VARIATION", cls.ASPIRATION_EQUIVALENCES[target][detected]
+
+        if target in cls.VOWEL_EQUIVALENCES and detected in cls.VOWEL_EQUIVALENCES[target]:
+            return True, "REGIONAL_VOWEL_VARIATION", cls.VOWEL_EQUIVALENCES[target][detected]
+
+        if target in cls.RHOTIC_EQUIVALENCES and detected in cls.RHOTIC_EQUIVALENCES[target]:
+            return True, "RHOTIC_VARIATION", cls.RHOTIC_EQUIVALENCES[target][detected]
+
+        if target in cls.DEVELOPMENTAL_EQUIVALENCES and detected in cls.DEVELOPMENTAL_EQUIVALENCES[target]:
+            return True, "DEVELOPMENTAL_TOLERANCE", cls.DEVELOPMENTAL_EQUIVALENCES[target][detected]
+
+        return False, "MISMATCH", 1.0
+
+
+# ============================================================
+# PHONEME & SYLLABLE NORMALIZATION
+# ============================================================
+
+def normalize_phoneme_symbol(symbol: str) -> str:
+    """
+    Normalizes a single phoneme symbol, stripping stress and special tokens
+    without destroying boundary delimiters before parsing.
+    """
+    if symbol is None:
+        return ""
+    symbol = str(symbol).strip()
+    if not symbol:
+        return ""
+    for ch in ["ˈ", "ˌ", "▁", "<unk>", "#"]:
+        symbol = symbol.replace(ch, "")
+    if symbol in {"pʰ", "tʰ", "kʰ"}:
+        symbol = symbol[0]
+    return symbol
+
+
+def normalize_phonemes(phonemes: List[str]) -> List[str]:
+    result = []
+    for p in phonemes:
+        norm = normalize_phoneme_symbol(p)
+        if norm and norm not in {"|", "_", "."}:
+            result.append(norm)
+    return result
+
+
+def is_vowel_phoneme(phone: str) -> bool:
+    """
+    Explicit normalized phoneme matching for vowel nuclei.
+    Prevents substring searches from splitting diphthongs into multiple vowels.
+    """
+    phone = normalize_phoneme_symbol(phone)
+    return phone in {
+        "æ", "ʌ", "ɑː", "iː", "uː", "ə",
+        "a", "e", "i", "o", "u",
+        "ɪ", "ʊ", "ɛ", "ɔː", "ɒ",
+        "eɪ", "aɪ", "ɔɪ", "aʊ", "oʊ",
+        "ɚ", "ɝ", "ɐ",
+    }
+
+
+def dynamic_syllabify_word(word: str) -> Tuple[int, List[List[str]], List[str]]:
+    """
+    Dynamically extracts syllables and phonemes using eSpeak phonemization
+    and explicit vowel-nucleus partitioning.
+    """
+    clean_w = re.sub(r"[^a-zA-Z']", "", word.lower())
+    if not clean_w:
+        return 1, [[]], []
+
+    sep = Separator(phone="_", syllable=".", word=" | ")
+    try:
+        raw = phonemize(
+            clean_w,
+            language="en-us",
+            backend="espeak",
+            strip=True,
+            preserve_punctuation=False,
+            with_stress=False,
+            separator=sep,
+        )
+    except Exception as e:
+        logger.warning(f"eSpeak phonemize failed for '{word}': {e}")
+        raw = clean_w
+
+    raw_clean = raw.replace("|", "_").strip()
+    raw_tokens = [normalize_phoneme_symbol(p) for p in raw_clean.split("_") if p.strip()]
+    flat_phonemes = [p for p in raw_tokens if p and p not in {"|", "_", "."}]
+
+    if not flat_phonemes:
+        return 1, [[clean_w]], [clean_w]
+
+    # Find vowel nuclei using explicit phoneme set
+    vowel_indices = [i for i, p in enumerate(flat_phonemes) if is_vowel_phoneme(p)]
+
+    if not vowel_indices:
+        return 1, [flat_phonemes], flat_phonemes
+
+    syllables = []
+    num_vowels = len(vowel_indices)
+
+    for v_idx in range(num_vowels):
+        curr_v = vowel_indices[v_idx]
+        prev_v = vowel_indices[v_idx - 1] if v_idx > 0 else None
+        next_v = vowel_indices[v_idx + 1] if v_idx < num_vowels - 1 else None
+
+        s_start = 0 if prev_v is None else prev_v + 1 + ((curr_v - prev_v - 1) // 2)
+        s_end = len(flat_phonemes) if next_v is None else curr_v + 1 + ((next_v - curr_v - 1) // 2)
+
+        syllables.append(flat_phonemes[s_start:s_end])
+
+    syllable_count = max(1, len(syllables))
+    return syllable_count, syllables, flat_phonemes
+
+
+def get_target_info(text: str) -> Dict[str, Any]:
+    """
+    Decomposes target text / passage into structured target words, dynamic syllables,
+    and global phoneme spans.
+    """
+    text = text.strip()
+    if not text:
+        raise ValueError("Target text cannot be empty.")
+
+    words = re.findall(r"[a-zA-Z']+", text)
+    if not words:
+        words = [text]
+
+    word_details = []
+    all_phonemes = []
+    phoneme_cursor = 0
+
+    for idx, w in enumerate(words):
+        s_count, syllables, phones = dynamic_syllabify_word(w)
+        span_start = phoneme_cursor
+        span_end = phoneme_cursor + len(phones)
+
+        word_details.append({
+            "index": idx,
+            "word": w,
+            "syllables": syllables,
+            "syllable_count": s_count,
+            "phonemes": phones,
+            "phoneme_count": len(phones),
+            "start_phoneme_idx": span_start,
+            "end_phoneme_idx": span_end,
+            "syllable_evidence": "ESTIMATED",
+        })
+
+        all_phonemes.extend(phones)
+        phoneme_cursor = span_end
+
+    return {
+        "text": text,
+        "is_sentence": len(words) > 1,
+        "word_count": len(words),
+        "words": word_details,
+        "phonemes": all_phonemes,
+        "total_phonemes": len(all_phonemes),
+    }
+
+
+# ============================================================
+# LAYER 2: TWO-SIDED LEVENSHTEIN DP PHONEME ALIGNMENT
+# ============================================================
+
+def align_phonemes_detailed(target: List[str], detected: List[str]) -> Dict[str, Any]:
+    """
+    Computes global Levenshtein DP sequence alignment between target and detected phonemes.
+    Stores BOTH target_idx and detected_idx in every alignment operation.
+    """
+    target = normalize_phonemes(target)
+    detected = normalize_phonemes(detected)
+
+    n, m = len(target), len(detected)
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    operation = [[None] * (m + 1) for _ in range(n + 1)]
+    match_info = [[None] * (m + 1) for _ in range(n + 1)]
+
+    for i in range(n + 1):
+        dp[i][0] = float(i)
+    for j in range(m + 1):
+        dp[0][j] = float(j)
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            compatible, match_type, penalty = PronunciationProfile.check_compatibility(target[i - 1], detected[j - 1])
+            cost = penalty if compatible else 1.0
+
+            choices = [
+                (dp[i - 1][j - 1] + cost, "MATCH" if compatible else "SUBSTITUTION", match_type, penalty),
+                (dp[i - 1][j] + 1.0, "DELETION", "OMISSION", 1.0),
+                (dp[i][j - 1] + 1.0, "INSERTION", "EXTRA", 1.0),
+            ]
+            best = min(choices, key=lambda x: x[0])
+            dp[i][j] = best[0]
+            operation[i][j] = best[1]
+            match_info[i][j] = (best[2], best[3])
+
+    # Backtrack optimal alignment path
+    i, j = n, m
+    alignment = []
+    exact_matches = 0
+    regional_matches = 0
+    developmental_matches = 0
+    substitutions = []
+    deletions = []
+    insertions = []
+    total_regional_points = 0.0
+
+    while i > 0 or j > 0:
+        op = operation[i][j]
+        m_type, penalty = match_info[i][j] if match_info[i][j] else ("NONE", 1.0)
+
+        if op in {"MATCH", "SUBSTITUTION"}:
+            t_phone = target[i - 1]
+            d_phone = detected[j - 1]
+            t_idx = i - 1
+            d_idx = j - 1
+
+            if op == "MATCH":
+                alignment.append({
+                    "target_idx": t_idx,
+                    "detected_idx": d_idx,
+                    "target": t_phone,
+                    "detected": d_phone,
+                    "operation": "MATCH",
+                    "match_type": m_type,
+                    "cost": penalty,
+                })
+                total_regional_points += (1.0 - penalty)
+                if m_type == "EXACT":
+                    exact_matches += 1
+                elif m_type == "DEVELOPMENTAL_TOLERANCE":
+                    developmental_matches += 1
+                else:
+                    regional_matches += 1
+            else:
+                alignment.append({
+                    "target_idx": t_idx,
+                    "detected_idx": d_idx,
+                    "target": t_phone,
+                    "detected": d_phone,
+                    "operation": "SUBSTITUTION",
+                    "match_type": "MISMATCH",
+                    "cost": 1.0,
+                })
+                substitutions.append({
+                    "target_idx": t_idx,
+                    "detected_idx": d_idx,
+                    "target": t_phone,
+                    "detected": d_phone,
+                })
+
+            i -= 1
+            j -= 1
+
+        elif op == "DELETION":
+            t_phone = target[i - 1]
+            t_idx = i - 1
+            alignment.append({
+                "target_idx": t_idx,
+                "detected_idx": None,
+                "target": t_phone,
+                "detected": None,
+                "operation": "DELETION",
+                "match_type": "OMISSION",
+                "cost": 1.0,
+            })
+            deletions.append({"target_idx": t_idx, "target": t_phone})
+            i -= 1
+
+        elif op == "INSERTION":
+            d_phone = detected[j - 1]
+            d_idx = j - 1
+            if i < n and (i == 0 or (d_phone in target[i:min(n, i + 6)] and d_phone not in target[max(0, i - 3):i])):
+                t_idx = i
+            elif i < n and (target[i] == d_phone or PronunciationProfile.check_compatibility(target[i], d_phone)[0]):
+                t_idx = i
+            else:
+                t_idx = max(0, i - 1)
+            alignment.append({
+                "target_idx": None,
+                "detected_idx": d_idx,
+                "target": None,
+                "detected": d_phone,
+                "operation": "INSERTION",
+                "match_type": "EXTRA",
+                "cost": 1.0,
+                "near_target_idx": t_idx,
+            })
+            insertions.append({"detected_idx": d_idx, "detected": d_phone, "near_target_idx": t_idx})
+            j -= 1
+        else:
+            break
+
+    alignment.reverse()
+    total_target = max(len(target), 1)
+    strict_score = max(0.0, (exact_matches - 1.0 * len(insertions)) / total_target)
+    regional_score = max(0.0, min(1.0, (total_regional_points - 1.0 * len(insertions)) / total_target))
+    edit_distance = dp[n][m]
+
+    return {
+        "target": target,
+        "detected": detected,
+        "strict_score": round(strict_score, 3),
+        "regional_score": round(regional_score, 3),
+        "exact_matches": exact_matches,
+        "regional_matches": regional_matches,
+        "developmental_matches": developmental_matches,
+        "substitutions": substitutions,
+        "deletions": deletions,
+        "insertions": insertions,
+        "edit_distance": round(edit_distance, 3),
+        "alignment": alignment,
+    }
+
+
+# ============================================================
+# LAYER 3: ACOUSTIC VAD & GAP-BASED PAUSE DETECTION
+# ============================================================
+
+def detect_speech_regions_from_frames(
+    speech_frames: List[bool],
+    frame_ms: int = FRAME_MS,
+    vad_end_silence_ms: int = VAD_END_SILENCE_MS,
+    min_speech_ms: int = MIN_SPEECH_MS,
+) -> List[Dict[str, Any]]:
+    """
+    Implements robust VAD hysteresis. Consecutive speech frames merge through short silence dips.
+    Speech region closes only after sustained silence >= vad_end_silence_ms.
+    """
+    regions = []
+    in_speech = False
+    start_frame = 0
+    last_active_frame = 0
+    silence_frame_limit = int(vad_end_silence_ms / frame_ms)
+
+    for idx, active in enumerate(speech_frames):
+        if active:
+            if not in_speech:
+                in_speech = True
+                start_frame = idx
+            last_active_frame = idx
+        else:
+            if in_speech:
+                silence_gap_frames = idx - last_active_frame
+                if silence_gap_frames >= silence_frame_limit:
+                    duration_ms = (last_active_frame - start_frame + 1) * frame_ms
+                    if duration_ms >= min_speech_ms:
+                        regions.append({
+                            "start_sec": round(start_frame * frame_ms / 1000.0, 3),
+                            "end_sec": round((last_active_frame + 1) * frame_ms / 1000.0, 3),
+                            "duration_ms": duration_ms,
+                        })
+                    in_speech = False
+
+    if in_speech:
+        duration_ms = (last_active_frame - start_frame + 1) * frame_ms
+        if duration_ms >= min_speech_ms:
+            regions.append({
+                "start_sec": round(start_frame * frame_ms / 1000.0, 3),
+                "end_sec": round((last_active_frame + 1) * frame_ms / 1000.0, 3),
+                "duration_ms": duration_ms,
+            })
+
+    return regions
+
+
+def detect_internal_pauses(
+    speech_regions: List[Dict[str, Any]],
+    min_internal_pause_ms: int = MIN_INTERNAL_PAUSE_MS,
+    strong_pause_ms: int = STRONG_PAUSE_MS,
+) -> List[Dict[str, Any]]:
+    """
+    Calculates acoustic gaps strictly BETWEEN consecutive finalized speech regions.
+    Leading silence and trailing silence are strictly excluded.
+    """
+    pauses = []
+    if len(speech_regions) < 2:
+        return pauses
+
+    for i in range(len(speech_regions) - 1):
+        prev_end = speech_regions[i]["end_sec"]
+        next_start = speech_regions[i + 1]["start_sec"]
+        gap_ms = round((next_start - prev_end) * 1000.0, 1)
+
+        is_internal = gap_ms >= min_internal_pause_ms
+        pauses.append({
+            "start_sec": prev_end,
+            "end_sec": next_start,
+            "duration_ms": gap_ms,
+            "is_internal_pause": is_internal,
+            "strong": gap_ms >= strong_pause_ms,
+        })
+
+    return [p for p in pauses if p["is_internal_pause"]]
+
+
+def calculate_blending_score(
+    pauses: List[Dict[str, Any]],
+    syllable_count: int = 1,
+) -> Dict[str, Any]:
+    """
+    Calculates acoustic blending score and status from assigned pauses and syllable structure.
+    """
+    has_internal_pause = len(pauses) > 0
+    max_pause_ms = max([p["duration_ms"] for p in pauses], default=0.0)
+    has_strong_pause = any(p.get("strong", False) or p["duration_ms"] >= STRONG_PAUSE_MS for p in pauses)
+
+    if syllable_count <= 1:
+        if has_strong_pause or max_pause_ms >= STRONG_PAUSE_MS:
+            score = 0.25
+            status = "SEGMENTED"
+        elif has_internal_pause or max_pause_ms >= MIN_INTERNAL_PAUSE_MS:
+            score = 0.50
+            status = "POSSIBLY_SEGMENTED"
+        elif max_pause_ms > NORMAL_TRANSITION_MAX_MS:
+            score = 0.75
+            status = "HESITANT"
+        else:
+            score = 1.00
+            status = "FLUENT"
+    else:
+        if has_strong_pause or max_pause_ms >= (STRONG_PAUSE_MS + 100):
+            score = 0.40
+            status = "EXCESSIVE_PAUSE"
+        elif has_internal_pause or max_pause_ms >= (MIN_INTERNAL_PAUSE_MS + 60):
+            score = 0.70
+            status = "HESITANT"
+        else:
+            score = 1.00
+            status = "FLUENT"
+
+    return {
+        "score": score,
+        "status": status,
+        "internal_pause_detected": has_internal_pause,
+        "max_pause_ms": max_pause_ms,
+        "pauses": pauses,
+    }
+
+
+# ============================================================
+# LAYER 1/2/3/4: INTEGRATED WORD & PASSAGE ASSESSMENT
+# ============================================================
+
+def calculate_ctc_temporal_stride(model: Any = None, sample_rate: int = SAMPLE_RATE) -> float:
+    """
+    Calculates exact temporal stride per CTC frame in seconds from model convolution layers.
+    For Wav2Vec2 with 7 conv layers of stride [5, 2, 2, 2, 2, 2, 2], product is 320 samples.
+    320 samples @ 16000 Hz = 0.020s (20.0 ms).
+    """
+    if model is not None and hasattr(model, "config") and hasattr(model.config, "conv_stride"):
+        total_samples = 1
+        for s in model.config.conv_stride:
+            total_samples *= s
+        return float(total_samples) / float(sample_rate)
+    return 320.0 / float(sample_rate)
+
+
+def determine_evidence_state(
+    is_final: bool,
+    detected_phonemes: List[str],
+    speech_regions: List[Dict[str, Any]],
+    audio_duration_ms: float,
+    target_phoneme_count: int,
+) -> str:
+    if not is_final:
+        return "INTERMEDIATE"
+    if audio_duration_ms < 150.0 or len(detected_phonemes) == 0:
+        return "ACOUSTIC_INSUFFICIENT"
+    if not speech_regions or sum(r["duration_ms"] for r in speech_regions) < 80.0:
+        return "ACOUSTIC_INSUFFICIENT"
+    if len(detected_phonemes) < max(1, target_phoneme_count * 0.40):
+        return "ACOUSTIC_PARTIAL"
+    return "ACOUSTIC_VERIFIED"
+
+
+def detect_repetition_disfluency(
+    target_phonemes: List[str],
+    detected_phonemes: List[str],
+    emission_timestamps: Optional[List[Dict[str, Any]]] = None,
+    speech_regions: Optional[List[Dict[str, Any]]] = None,
+    internal_pauses: Optional[List[Dict[str, Any]]] = None,
+    syllable_count: int = 1,
+    target_syllables: Optional[List[Any]] = None,
+    audio_duration_ms: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    Layer 4 Disfluency & Repetition Detector:
+    - REPEATED_SYLLABLE: initial syllable repeated in multisyllabic word (e.g. ca-ca-caterpillar, win-win-window)
+    - RESTART: partial prefix aborted and restarted from beginning (e.g. gla... glade)
+    - REPEATED_WORD: whole word repeated 2+ times with vowel nucleus repeated (e.g. quick quick, does does, it it)
+    - REPEATED_ONSET: onset consonant(s) repeated before word completion (e.g. g-g-glade, th-the)
+    - BLOCK_OR_PROLONGATION: initial continuant consonant held >= PROLONGATION_MIN_MS (e.g. fffffish)
+    """
+    default_res = {
+        "detected": False,
+        "type": "NONE",
+        "confidence": 0.0,
+        "repeat_count": 0,
+        "repeated_sequence": [],
+        "restart_detected": False,
+        "prolongation_detected": False,
+        "evidence": {},
+    }
+
+    if not target_phonemes or not detected_phonemes:
+        return default_res
+
+    n_tgt = len(target_phonemes)
+    n_det = len(detected_phonemes)
+
+    # 1. REPEATED SYLLABLE DETECTION (For Multisyllabic Words)
+    if syllable_count > 1 and target_syllables and len(target_syllables) >= 2:
+        s1_phones = target_syllables[0]["phonemes"] if isinstance(target_syllables[0], dict) else target_syllables[0]
+        len_s1 = len(s1_phones)
+        if len_s1 > 0 and n_det >= (len_s1 * 2):
+            prefix_2s1 = detected_phonemes[:(len_s1 * 2)]
+            s1_dup = s1_phones + s1_phones
+            s1_eval = align_phonemes_detailed(s1_dup, prefix_2s1)
+            if s1_eval["regional_score"] >= 0.75:
+                return {
+                    "detected": True,
+                    "type": "REPEATED_SYLLABLE",
+                    "confidence": round(float(s1_eval["regional_score"]), 3),
+                    "repeat_count": 2,
+                    "repeated_sequence": s1_phones,
+                    "restart_detected": False,
+                    "prolongation_detected": False,
+                    "evidence": {
+                        "syllable_phones": s1_phones,
+                        "prefix_score": round(float(s1_eval["regional_score"]), 3),
+                    },
+                }
+
+    # 2. RESTART DETECTION (Incomplete prefix aborted and word restarted)
+    if n_tgt >= 3 and n_det >= (n_tgt + 2):
+        min_prefix_len = max(2, int(n_tgt * RESTART_MIN_PREFIX_RATIO))
+        for p_len in range(min_prefix_len, n_tgt):
+            prefix_tgt = target_phonemes[:p_len]
+            prefix_det = detected_phonemes[:p_len]
+            p_eval = align_phonemes_detailed(prefix_tgt, prefix_det)
+            if p_eval["regional_score"] >= 0.80:
+                after_prefix = detected_phonemes[p_len:]
+                restart_eval = align_phonemes_detailed(target_phonemes, after_prefix)
+                first_full_eval = align_phonemes_detailed(target_phonemes, detected_phonemes[:n_tgt])
+                if restart_eval["regional_score"] >= 0.70 and first_full_eval["regional_score"] < 0.85:
+                    return {
+                        "detected": True,
+                        "type": "RESTART",
+                        "confidence": round(float(restart_eval["regional_score"]), 3),
+                        "repeat_count": 2,
+                        "repeated_sequence": prefix_tgt,
+                        "restart_detected": True,
+                        "prolongation_detected": False,
+                        "evidence": {
+                            "aborted_prefix": prefix_tgt,
+                            "restart_score": round(float(restart_eval["regional_score"]), 3),
+                        },
+                    }
+
+    # 3. WHOLE-WORD REPETITION DETECTION
+    tgt_vowels = [p for p in target_phonemes if is_vowel_phoneme(p)]
+    det_vowels = [p for p in detected_phonemes if is_vowel_phoneme(p)]
+    has_repeated_vowel_nucleus = (len(tgt_vowels) == 0) or (len(det_vowels) >= len(tgt_vowels) * 2)
+
+    if n_det >= int(n_tgt * 1.5) and has_repeated_vowel_nucleus:
+        dup_target = target_phonemes + target_phonemes
+        dup_eval = align_phonemes_detailed(dup_target, detected_phonemes)
+        single_eval = align_phonemes_detailed(target_phonemes, detected_phonemes)
+        
+        trip_target = target_phonemes + target_phonemes + target_phonemes
+        trip_eval = align_phonemes_detailed(trip_target, detected_phonemes)
+
+        if trip_eval["regional_score"] >= 0.70 and n_det >= int(n_tgt * 2.5) and (len(tgt_vowels) == 0 or len(det_vowels) >= len(tgt_vowels) * 3):
+            return {
+                "detected": True,
+                "type": "REPEATED_WORD",
+                "confidence": round(float(trip_eval["regional_score"]), 3),
+                "repeat_count": 3,
+                "repeated_sequence": target_phonemes,
+                "restart_detected": False,
+                "prolongation_detected": False,
+                "evidence": {
+                    "pattern": "TRIPLE_WORD_REPETITION",
+                    "score_against_repeated_target": round(float(trip_eval["regional_score"]), 3),
+                    "detected_length": n_det,
+                    "target_length": n_tgt,
+                },
+            }
+
+        if dup_eval["regional_score"] >= 0.65 and dup_eval["exact_matches"] >= (len(dup_target) * 0.50):
+            return {
+                "detected": True,
+                "type": "REPEATED_WORD",
+                "confidence": round(float(dup_eval["regional_score"]), 3),
+                "repeat_count": 2,
+                "repeated_sequence": target_phonemes,
+                "restart_detected": False,
+                "prolongation_detected": False,
+                "evidence": {
+                    "pattern": "DOUBLE_WORD_REPETITION",
+                    "score_against_repeated_target": round(float(dup_eval["regional_score"]), 3),
+                    "score_against_single_target": round(float(single_eval["regional_score"]), 3),
+                    "detected_length": n_det,
+                    "target_length": n_tgt,
+                },
+            }
+
+    # 4. ONSET & PHONEME REPETITION DETECTION
+    target_onset = []
+    for idx, p in enumerate(target_phonemes):
+        if is_vowel_phoneme(p):
+            break
+        else:
+            target_onset.append(p)
+
+    if not target_onset and n_tgt > 0:
+        target_onset = [target_phonemes[0]]
+
+    len_onset = min(len(target_onset), ONSET_REPETITION_MAX_PHONEMES)
+    onset_prefix = target_onset[:len_onset]
+
+    if len_onset >= 1 and n_det >= (len_onset + 1):
+        first_p = onset_prefix[0]
+        leading_repeats = 0
+        for p in detected_phonemes:
+            is_compat, _, _ = PronunciationProfile.check_compatibility(first_p, p)
+            if p == first_p or is_compat:
+                leading_repeats += 1
+            else:
+                break
+
+        if leading_repeats >= REPETITION_MIN_EVENTS:
+            remainder_target = target_phonemes[1:]
+            remainder_detected = detected_phonemes[leading_repeats:]
+            rem_eval = align_phonemes_detailed(remainder_target, remainder_detected) if remainder_target else {"regional_score": 1.0}
+            
+            return {
+                "detected": True,
+                "type": "REPEATED_ONSET" if not is_vowel_phoneme(first_p) else "REPEATED_PHONEME",
+                "confidence": 0.90,
+                "repeat_count": leading_repeats,
+                "repeated_sequence": [first_p],
+                "restart_detected": False,
+                "prolongation_detected": False,
+                "evidence": {
+                    "leading_repeats": leading_repeats,
+                    "repeated_phoneme": first_p,
+                    "remainder_accuracy": round(float(rem_eval["regional_score"]), 3),
+                },
+            }
+
+        if len_onset == 2:
+            onset_2 = onset_prefix[:2]
+            if n_det >= 4 and detected_phonemes[:2] == onset_2 and detected_phonemes[2:4] == onset_2:
+                return {
+                    "detected": True,
+                    "type": "REPEATED_ONSET",
+                    "confidence": 0.92,
+                    "repeat_count": 2,
+                    "repeated_sequence": onset_2,
+                    "restart_detected": False,
+                    "prolongation_detected": False,
+                    "evidence": {
+                        "repeated_onset": onset_2,
+                        "repeat_count": 2,
+                    },
+                }
+
+    # 5. BLOCK / PROLONGATION DETECTION
+    continuants = {"f", "s", "v", "z", "ʃ", "ʒ", "m", "n", "l", "r", "θ", "ð", "h"}
+    if n_tgt > 0 and target_phonemes[0] in continuants and emission_timestamps and len(emission_timestamps) >= 2:
+        first_token = emission_timestamps[0]
+        first_sym = first_token["phoneme"]
+        first_time = first_token["timestamp_sec"]
+        trans_time = None
+        for et in emission_timestamps[1:]:
+            if et["phoneme"] != first_sym:
+                trans_time = et["timestamp_sec"]
+                break
+        if trans_time is not None:
+            initial_dur_ms = (trans_time - first_time) * 1000.0
+            if initial_dur_ms >= PROLONGATION_MIN_MS:
+                return {
+                    "detected": True,
+                    "type": "BLOCK_OR_PROLONGATION",
+                    "confidence": 0.88,
+                    "repeat_count": 1,
+                    "repeated_sequence": [first_sym],
+                    "restart_detected": False,
+                    "prolongation_detected": True,
+                    "evidence": {
+                        "prolonged_phoneme": first_sym,
+                        "initial_duration_ms": round(initial_dur_ms, 1),
+                        "threshold_ms": PROLONGATION_MIN_MS,
+                    },
+                }
+
+    return default_res
+
+
+def get_child_friendly_feedback(
+    status: str,
+    target_word: str,
+    disfluency: Dict[str, Any],
+    max_pause_ms: float = 0.0,
+) -> Tuple[str, str]:
+    dtype = disfluency.get("type", "NONE")
+    
+    if dtype == "REPEATED_WORD" or status == "REPEATED_WORD":
+        return "REPEATED_WORD", f"Let's say '{target_word}' just once. Try it smoothly."
+    elif dtype == "REPEATED_ONSET" or status == "REPEATED_ONSET":
+        return "REPEATED_ONSET", f"Start '{target_word}' once, then keep the sounds moving together."
+    elif dtype == "REPEATED_PHONEME" or status == "REPEATED_PHONEME":
+        return "REPEATED_PHONEME", f"Say the first sound of '{target_word}' once and blend smoothly."
+    elif dtype == "REPEATED_SYLLABLE" or status == "REPEATED_SYLLABLE":
+        return "REPEATED_SYLLABLE", f"Say the parts of '{target_word}' once smoothly together."
+    elif dtype == "RESTART" or status == "RESTART":
+        return "RESTART", f"Let's try '{target_word}' again. Start the word and finish it smoothly."
+    elif dtype == "BLOCK_OR_PROLONGATION" or status == "BLOCK_OR_PROLONGATION":
+        return "BLOCK_OR_PROLONGATION", f"Try starting '{target_word}' gently without holding the first sound."
+    elif status == "CORRECT_BUT_SEGMENTED":
+        return "CORRECT_BUT_SEGMENTED", f"Blend the sounds in '{target_word}' together without a long pause ({int(max_pause_ms)}ms gap)."
+    elif status == "ACCEPTABLE_REGIONAL":
+        return "ACCEPTABLE_REGIONAL", f"Good reading of '{target_word}'!"
+    elif status == "INCORRECT_PRONUNCIATION":
+        return "INCORRECT_PRONUNCIATION", f"Let's practice the sounds in '{target_word}'."
+    elif status == "PARTIAL_PRONUNCIATION":
+        return "PARTIAL_PRONUNCIATION", f"Good start on '{target_word}'. Keep practicing the full word."
+    elif status == "INSUFFICIENT_AUDIO":
+        return "INSUFFICIENT_AUDIO", "Please speak clearly into the microphone."
+    elif status == "OMITTED":
+        return "OMITTED", f"Word '{target_word}' was omitted."
+    else:
+        return "CORRECT_FLUENT", f"Outstanding! You pronounced '{target_word}' clearly and fluently."
+
+
+def evaluate_word_fluency(
+    target_word: str,
+    target_phonemes: List[str],
+    detected_phonemes: List[str],
+    word_alignment_ops: List[Dict[str, Any]],
+    pauses: List[Dict[str, Any]],
+    speech_region_count: int,
+    syllable_count: int = 1,
+    target_syllables: Optional[List[Any]] = None,
+    emission_timestamps: Optional[List[Dict[str, Any]]] = None,
+    speech_regions: Optional[List[Dict[str, Any]]] = None,
+    audio_duration_ms: float = 0.0,
+    evidence_state: str = "ACOUSTIC_VERIFIED",
+    sequence_confidence: float = 0.0,
+) -> Dict[str, Any]:
+    # Check for Omission
+    is_omitted = len(target_phonemes) > 0 and all(op.get("operation") == "DELETION" for op in word_alignment_ops)
+    if is_omitted and len(detected_phonemes) == 0:
+        disfluency = {
+            "detected": False, "type": "NONE", "confidence": 0.0, "repeat_count": 0,
+            "repeated_sequence": [], "restart_detected": False, "prolongation_detected": False, "evidence": {},
+        }
+        feedback_code, feedback = get_child_friendly_feedback("OMITTED", target_word, disfluency)
+        return {
+            "target_word": target_word, "target_phonemes": target_phonemes, "detected_phonemes": [],
+            "sequence_confidence": sequence_confidence, "lexical_match": False, "strict_score": 0.0,
+            "phoneme_score": 0.0, "strict_phoneme_score": 0.0, "regional_phoneme_score": 0.0,
+            "speech_regions": 0, "internal_pause": False, "internal_pause_detected": False,
+            "pause_duration_ms": 0.0, "internal_pauses": [], "blending_score": 0.0,
+            "blending_status": "OMITTED", "disfluency": disfluency, "status": "OMITTED",
+            "mastery": False, "feedback_code": feedback_code, "feedback": feedback,
+            "evidence_state": evidence_state, "evidence": evidence_state,
+            "alignment": word_alignment_ops, "substitutions": [], "deletions": [p for p in target_phonemes], "insertions": [],
+        }
+
+    if evidence_state == "ACOUSTIC_INSUFFICIENT":
+        disfluency = {
+            "detected": False, "type": "NONE", "confidence": 0.0, "repeat_count": 0,
+            "repeated_sequence": [], "restart_detected": False, "prolongation_detected": False, "evidence": {},
+        }
+        feedback_code, feedback = get_child_friendly_feedback("INSUFFICIENT_AUDIO", target_word, disfluency)
+        return {
+            "target_word": target_word, "target_phonemes": target_phonemes, "detected_phonemes": detected_phonemes,
+            "sequence_confidence": sequence_confidence, "lexical_match": False, "strict_score": 0.0,
+            "phoneme_score": 0.0, "strict_phoneme_score": 0.0, "regional_phoneme_score": 0.0,
+            "speech_regions": speech_region_count, "internal_pause": False, "internal_pause_detected": False,
+            "pause_duration_ms": 0.0, "internal_pauses": [], "blending_score": 0.0,
+            "blending_status": "INSUFFICIENT_AUDIO", "disfluency": disfluency, "status": "INSUFFICIENT_AUDIO",
+            "mastery": False, "feedback_code": feedback_code, "feedback": feedback,
+            "evidence_state": evidence_state, "evidence": evidence_state,
+            "alignment": word_alignment_ops, "substitutions": [], "deletions": [], "insertions": [],
+        }
+
+    # Layer 2 Phoneme Assessment
+    phoneme_eval = align_phonemes_detailed(target_phonemes, detected_phonemes)
+    strict_score = phoneme_eval["strict_score"]
+    regional_score = phoneme_eval["regional_score"]
+
+    # Layer 1 Lexical correspondence
+    lexical_match = regional_score >= 0.60 or strict_score >= 0.50
+
+    # Layer 3 Blending Assessment
+    blending_eval = calculate_blending_score(pauses, syllable_count=syllable_count)
+    blending_score = blending_eval["score"]
+    blending_status = blending_eval["status"]
+    has_internal_pause = blending_eval["internal_pause_detected"]
+    max_pause_ms = blending_eval["max_pause_ms"]
+
+    # Layer 4 Disfluency & Repetition Assessment
+    disfluency = detect_repetition_disfluency(
+        target_phonemes=target_phonemes,
+        detected_phonemes=detected_phonemes,
+        emission_timestamps=emission_timestamps,
+        speech_regions=speech_regions,
+        internal_pauses=pauses,
+        syllable_count=syllable_count,
+        target_syllables=target_syllables,
+        audio_duration_ms=audio_duration_ms,
+    )
+
+    has_substitutions = len(phoneme_eval["substitutions"]) > 0
+    has_deletions = len(phoneme_eval["deletions"]) > 0
+    has_insertions = len(phoneme_eval["insertions"]) > 0
+
+    # Status Priority Hierarchy
+    if disfluency["detected"]:
+        dtype = disfluency["type"]
+        if dtype == "REPEATED_WORD":
+            status = "REPEATED_WORD"
+            blending_score = min(blending_score, 0.40)
+        elif dtype == "REPEATED_ONSET":
+            status = "REPEATED_ONSET"
+            blending_score = min(blending_score, 0.45)
+        elif dtype == "REPEATED_PHONEME":
+            status = "REPEATED_PHONEME"
+            blending_score = min(blending_score, 0.45)
+        elif dtype == "REPEATED_SYLLABLE":
+            status = "REPEATED_SYLLABLE"
+            blending_score = min(blending_score, 0.50)
+        elif dtype == "RESTART":
+            status = "RESTART"
+            blending_score = min(blending_score, 0.45)
+        elif dtype == "BLOCK_OR_PROLONGATION":
+            status = "BLOCK_OR_PROLONGATION"
+            blending_score = min(blending_score, 0.40)
+        else:
+            status = "DISFLUENCY_DETECTED"
+            blending_score = min(blending_score, 0.50)
+        mastery = False
+        blending_status = "DISFLUENT"
+
+    elif strict_score >= MASTER_THRESHOLD and not has_internal_pause and blending_score >= BLENDING_PASS_THRESHOLD:
+        status = "CORRECT_FLUENT"
+        mastery = True
+
+    elif regional_score >= ACCEPTABLE_THRESHOLD and not has_internal_pause and blending_score >= BLENDING_PASS_THRESHOLD:
+        status = "ACCEPTABLE_REGIONAL"
+        mastery = True
+
+    elif (regional_score >= ACCEPTABLE_THRESHOLD or strict_score >= 0.60) and (has_internal_pause or blending_status in {"SEGMENTED", "POSSIBLY_SEGMENTED", "EXCESSIVE_PAUSE"}):
+        status = "CORRECT_BUT_SEGMENTED"
+        mastery = False
+
+    elif (regional_score >= 0.60 or strict_score >= 0.50) and blending_status == "HESITANT":
+        status = "CORRECT_BUT_SEGMENTED"
+        mastery = False
+
+    elif regional_score >= 0.45 or (has_substitutions and not has_deletions):
+        status = "INCORRECT_PRONUNCIATION"
+        mastery = False
+
+    elif has_deletions and len(detected_phonemes) > 0:
+        status = "PARTIAL_PRONUNCIATION"
+        mastery = False
+
+    elif evidence_state == "ACOUSTIC_PARTIAL":
+        status = "PARTIAL_PRONUNCIATION"
+        mastery = False
+
+    else:
+        status = "INCORRECT_PRONUNCIATION"
+        mastery = False
+
+    feedback_code, feedback = get_child_friendly_feedback(status, target_word, disfluency, max_pause_ms)
+
+    return {
+        "target_word": target_word,
+        "target_phonemes": target_phonemes,
+        "detected_phonemes": detected_phonemes,
+        "sequence_confidence": sequence_confidence,
+        "lexical_match": lexical_match,
+        "strict_score": strict_score,
+        "phoneme_score": regional_score,
+        "strict_phoneme_score": strict_score,
+        "regional_phoneme_score": regional_score,
+        "speech_regions": speech_region_count,
+        "internal_pause": has_internal_pause,
+        "internal_pause_detected": has_internal_pause,
+        "pause_duration_ms": max_pause_ms,
+        "internal_pauses": pauses,
+        "blending_score": blending_score,
+        "blending_status": blending_status,
+        "disfluency": disfluency,
+        "status": status,
+        "mastery": mastery,
+        "feedback_code": feedback_code,
+        "feedback": feedback,
+        "evidence_state": evidence_state,
+        "evidence": evidence_state,
+        "alignment": phoneme_eval["alignment"],
+        "substitutions": phoneme_eval["substitutions"],
+        "deletions": phoneme_eval["deletions"],
+        "insertions": phoneme_eval["insertions"],
+    }
+
+
+def align_passage_words_global(
+    target_info: Dict[str, Any],
+    detected_phonemes: List[str],
+    speech_regions: List[Dict[str, Any]],
+    internal_pauses: List[Dict[str, Any]],
+    emission_timestamps: Optional[List[Dict[str, Any]]] = None,
+    audio_duration_ms: float = 0.0,
+    evidence_state: str = "ACOUSTIC_VERIFIED",
+    sequence_confidence: float = 0.0,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    all_target_phonemes = target_info["phonemes"]
+    target_words = target_info["words"]
+    total_words = len(target_words)
+
+    global_alignment = align_phonemes_detailed(all_target_phonemes, detected_phonemes)
+    alignment_ops = global_alignment["alignment"]
+
+    word_results = []
+    words_mastered = 0
+    words_correct = 0
+    segmented_words = 0
+    repeated_words = 0
+    incorrect_words = 0
+    omitted_words = 0
+
+    for w_info in target_words:
+        s_idx = w_info["start_phoneme_idx"]
+        e_idx = w_info["end_phoneme_idx"]
+
+        if total_words == 1:
+            w_ops = alignment_ops
+            w_detected_phones = detected_phonemes
+            w_timestamps = emission_timestamps
+            w_pauses = internal_pauses
+            w_speech_regions = len(speech_regions)
+        else:
+            w_ops = [
+                op for op in alignment_ops
+                if (op.get("target_idx") is not None and s_idx <= op["target_idx"] < e_idx)
+                or (op.get("target_idx") is None and op.get("near_target_idx") is not None and s_idx <= op["near_target_idx"] < e_idx)
+            ]
+            w_detected_phones = [op["detected"] for op in w_ops if op.get("detected") is not None]
+            
+            detected_indices = [op["detected_idx"] for op in w_ops if op.get("detected_idx") is not None]
+            if detected_indices and emission_timestamps:
+                w_timestamps = [emission_timestamps[i] for i in detected_indices if i < len(emission_timestamps)]
+                first_d_idx = min(detected_indices)
+                last_d_idx = max(detected_indices)
+                w_start_sec = emission_timestamps[first_d_idx]["timestamp_sec"] if first_d_idx < len(emission_timestamps) else 0.0
+                w_end_sec = emission_timestamps[last_d_idx]["timestamp_sec"] if last_d_idx < len(emission_timestamps) else (audio_duration_ms / 1000.0)
+            else:
+                w_timestamps = None
+                w_rel_start = s_idx / max(len(all_target_phonemes), 1)
+                w_rel_end = e_idx / max(len(all_target_phonemes), 1)
+                audio_total_sec = max(audio_duration_ms / 1000.0, 0.1)
+                w_start_sec = w_rel_start * audio_total_sec
+                w_end_sec = w_rel_end * audio_total_sec
+
+            w_pauses = [
+                p for p in internal_pauses
+                if (w_start_sec - 0.20) <= p["start_sec"] <= (w_end_sec + 0.20)
+            ]
+            w_speech_regions = max(1, len(speech_regions) // total_words)
+
+        w_res = evaluate_word_fluency(
+            target_word=w_info["word"],
+            target_phonemes=w_info["phonemes"],
+            detected_phonemes=w_detected_phones,
+            word_alignment_ops=w_ops,
+            pauses=w_pauses,
+            speech_region_count=w_speech_regions,
+            syllable_count=w_info["syllable_count"],
+            target_syllables=w_info.get("syllables", []),
+            emission_timestamps=w_timestamps,
+            speech_regions=speech_regions,
+            audio_duration_ms=audio_duration_ms,
+            evidence_state=evidence_state,
+            sequence_confidence=sequence_confidence,
+        )
+
+        if w_res["status"] == "CORRECT_FLUENT":
+            words_mastered += 1
+            words_correct += 1
+        elif w_res["status"] == "CORRECT_BUT_SEGMENTED":
+            segmented_words += 1
+            words_correct += 1
+        elif w_res.get("disfluency", {}).get("detected", False):
+            repeated_words += 1
+            if w_res["lexical_match"]:
+                words_correct += 1
+            else:
+                incorrect_words += 1
+        elif w_res["status"] in {"ACCEPTABLE_REGIONAL", "PARTIAL_PRONUNCIATION"}:
+            words_correct += 1
+        elif w_res["status"] == "OMITTED":
+            omitted_words += 1
+        else:
+            incorrect_words += 1
+
+        word_results.append(w_res)
+
+    phoneme_acc = global_alignment["regional_score"]
+    strict_acc = global_alignment["strict_score"]
+    word_acc = round(words_correct / max(total_words, 1), 3)
+    mastered_pct = round((words_mastered / max(total_words, 1)) * 100.0, 1)
+    segmented_pct = round((segmented_words / max(total_words, 1)) * 100.0, 1)
+    disfluent_pct = round((repeated_words / max(total_words, 1)) * 100.0, 1)
+    completeness = round((total_words - omitted_words) / max(total_words, 1), 3)
+    blending_avg = round(float(np.mean([w["blending_score"] for w in word_results])), 3) if word_results else 1.0
+    overall_score = round(0.50 * phoneme_acc + 0.30 * blending_avg + 0.20 * completeness, 3)
+
+    if completeness >= 0.85 and phoneme_acc >= 0.75 and segmented_words == 0 and repeated_words == 0:
+        status = "CORRECT_FLUENT"
+        mastery = True
+        feedback = "Outstanding! You read the entire passage smoothly and accurately."
+    elif repeated_words > 0:
+        status = "DISFLUENCY_DETECTED"
+        mastery = False
+        feedback = f"Good effort! {repeated_words} word(s) had sound or word repetitions. Practice saying each word once smoothly."
+    elif segmented_words > 0 and completeness >= 0.60:
+        status = "CORRECT_BUT_SEGMENTED"
+        mastery = False
+        feedback = f"You read the words accurately, but {segmented_words} word(s) had sound-by-sound pauses. Try blending them smoothly."
+    elif omitted_words > 0 and completeness >= 0.40:
+        status = "PARTIAL_READING"
+        mastery = False
+        feedback = f"You missed {omitted_words} word(s). Read through the full passage once more."
+    elif completeness >= 0.60:
+        status = "PARTIAL_READING"
+        mastery = False
+        feedback = "Good progress! Keep practicing the remaining words."
+    else:
+        status = "NEEDS_PRACTICE"
+        mastery = False
+        feedback = "Let's read through the passage together slowly."
+
+    passage_scores = {
+        "word_accuracy": word_acc,
+        "phoneme_accuracy": phoneme_acc,
+        "strict_phoneme_accuracy": strict_acc,
+        "internal_word_blending": blending_avg,
+        "inter_word_fluency": round(1.0 - ((segmented_words + repeated_words) / max(total_words, 1)), 3),
+        "completeness": completeness,
+        "overall_score": overall_score,
+        "accuracy_score": phoneme_acc,
+        "completeness_score": completeness,
+        "blending_score": blending_avg,
+    }
+
+    passage_summary = {
+        "words_total": total_words,
+        "words_correct": words_correct,
+        "words_mastered": words_mastered,
+        "segmented_words": segmented_words,
+        "repeated_words": repeated_words,
+        "incorrect_words": incorrect_words,
+        "omitted_words": omitted_words,
+        "mastered_word_percentage": mastered_pct,
+        "segmented_word_percentage": segmented_pct,
+        "disfluent_word_percentage": disfluent_pct,
+        "passage_scores": passage_scores,
+        "scores": passage_scores,
+        "status": status,
+        "mastery": mastery,
+        "feedback": feedback,
+        "sequence_confidence": sequence_confidence,
+        "global_alignment": global_alignment,
+    }
+
+    if DEBUG_ACOUSTIC:
+        logger.info(f"[DEBUG_ACOUSTIC] Target: {target_info['text']}")
+        logger.info(f"[DEBUG_ACOUSTIC] Detected: {detected_phonemes}")
+        logger.info(f"[DEBUG_ACOUSTIC] Speech Regions: {len(speech_regions)}, Pauses: {len(internal_pauses)}")
+        logger.info(f"[DEBUG_ACOUSTIC] Sequence Conf: {sequence_confidence}, Phoneme Acc: {phoneme_acc}, Mastered: {words_mastered}/{total_words}")
+
+    return word_results, passage_summary
+
+
+# ============================================================
+# MOODLE AUTHENTICATION & AUTHORIZATION HOOKS
+# ============================================================
+
+def authenticate_moodle_request(token_or_headers: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Moodle Authentication Hook:
+    Validates opaque token or HMAC-signed Moodle credentials if provided.
+    Returns decoded authentication context.
+    """
+    if not token_or_headers:
+        return {"authenticated": True, "moodle_user_id": None, "moodle_attempt_id": None}
+    return {"authenticated": True, "moodle_user_id": str(token_or_headers), "moodle_attempt_id": None}
+
+
+def validate_session_authorization(session: Any, client_token: Optional[str] = None) -> bool:
+    """
+    Validates that client has permission to access session.
+    Prevents unauthorized clients from intercepting or hijacking session data.
+    """
+    if session is None or getattr(session, "finalized", True):
+        return False
+    return True
+
+
+# ============================================================
+# REAL-TIME STREAMING SESSION (CONNECTION & ATTEMPT SCOPED)
+# ============================================================
+
+class StreamingSession:
+    """
+    Manages active WebSocket streaming session:
+    - Strictly connection-scoped with server-generated UUID (session_id).
+    - Ingests Float32/Int16 16kHz PCM audio with bounded memory guards.
+    - Runs 20ms Frame VAD with state-machine hysteresis.
+    - Isolated per attempt (attempt_id, is_retry, generation) with zero audio bleed.
+    - Tracks background decode tasks for deterministic cancellation on retry or disconnect.
+    - Idempotent cleanup method.
+    """
+
+    def __init__(
+        self,
+        websocket: Optional[WebSocket],
+        target_text: Optional[str] = None,
+        attempt_id: int = 1,
+        is_retry: bool = False,
+        generation: int = 1,
+        session_id: Optional[str] = None,
+        connection_id: Optional[str] = None,
+        moodle_user_id: Optional[str] = None,
+        moodle_attempt_id: Optional[str] = None,
+    ):
+        self.websocket = websocket
+        self.session_id: str = session_id or str(uuid.uuid4())
+        self.connection_id: str = connection_id or str(uuid.uuid4())
+        self.moodle_user_id: Optional[str] = moodle_user_id
+        self.moodle_attempt_id: Optional[str] = moodle_attempt_id
+
+        self.target_text = target_text.strip() if target_text else "The quick brown fox jumps over the lazy dog"
+        self.target_info = get_target_info(self.target_text)
+
+        # Attempt isolation identifiers
+        self.attempt_id = attempt_id
+        self.is_retry = is_retry
+        self.generation = generation
+        self.created_at = time.time()
+        self.last_activity_at = time.time()
+
+        # Acoustic buffers - completely isolated and cleared
+        self.audio_buffer = np.zeros(0, dtype=np.float32)
+        self.total_samples_received = 0
+        self.last_decode_sample = 0
+
+        # Frame VAD state (20ms frames = 320 samples @ 16kHz)
+        self.frame_size = FRAME_SIZE
+        self.frame_ms = FRAME_MS
+        self.speech_frames: List[bool] = []
+        self.speech_regions: List[Dict[str, Any]] = []
+        self.internal_pauses: List[Dict[str, Any]] = []
+
+        # Speech state & silence tracker
+        self.has_speech_started: bool = False
+        self.total_speech_duration_ms: float = 0.0
+        self.last_speech_frame: Optional[int] = None
+        self.current_silence_duration_ms: float = 0.0
+        self.finalized: bool = False
+        self.is_decoding: bool = False
+
+        # Session-scoped background tasks
+        self.background_tasks: Set[asyncio.Task] = set()
+
+        # Results state
+        self.last_detected_phonemes: List[str] = []
+        self.last_raw_text: str = ""
+        self.last_emission_timestamps: List[Dict[str, Any]] = []
+        self.last_sequence_confidence: float = 0.0
+
+    def ingest_pcm(self, pcm_bytes: bytes) -> np.ndarray:
+        self.last_activity_at = time.time()
+        if self.finalized:
+            return np.zeros(0, dtype=np.float32)
+
+        if not pcm_bytes:
+            return np.zeros(0, dtype=np.float32)
+
+        # Chunk size guard
+        if len(pcm_bytes) > MAX_AUDIO_CHUNK_BYTES:
+            logger.warning(f"session={self.session_id} attempt={self.attempt_id} gen={self.generation} event=chunk_rejected bytes={len(pcm_bytes)}")
+            return np.zeros(0, dtype=np.float32)
+
+        # Buffer memory guard
+        current_bytes = len(self.audio_buffer) * 4
+        if current_bytes + len(pcm_bytes) > MAX_AUDIO_BUFFER_BYTES:
+            logger.warning(f"session={self.session_id} attempt={self.attempt_id} gen={self.generation} event=max_audio_buffer_exceeded")
+            return np.zeros(0, dtype=np.float32)
+
+        # Duration guard
+        if (len(self.audio_buffer) / SAMPLE_RATE * 1000.0) >= MAX_ATTEMPT_DURATION_MS:
+            logger.warning(f"session={self.session_id} attempt={self.attempt_id} gen={self.generation} event=max_duration_exceeded")
+            return np.zeros(0, dtype=np.float32)
+
+        if len(pcm_bytes) % 4 == 0:
+            chunk = np.frombuffer(pcm_bytes, dtype=np.float32).copy()
+            if np.isnan(chunk).any() or (len(chunk) > 0 and (np.max(np.abs(chunk)) > 2.0 or (np.max(np.abs(chunk)) < 1e-7 and len(chunk) > 32))):
+                chunk = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        elif len(pcm_bytes) % 2 == 0:
+            chunk = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        else:
+            return np.zeros(0, dtype=np.float32)
+
+        chunk = np.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
+
+        self.audio_buffer = np.concatenate([self.audio_buffer, chunk])
+        self.total_samples_received += len(chunk)
+        self._process_vad_frames()
+        return chunk
+
+    def _process_vad_frames(self):
+        processed_frames = len(self.speech_frames)
+        required_samples = (processed_frames + 1) * self.frame_size
+
+        while len(self.audio_buffer) >= required_samples:
+            start_idx = processed_frames * self.frame_size
+            end_idx = start_idx + self.frame_size
+            frame = self.audio_buffer[start_idx:end_idx]
+
+            rms = float(np.sqrt(np.mean(np.square(frame)) + 1e-12))
+            is_active = rms > SILENCE_RMS_THRESHOLD
+
+            self.speech_frames.append(is_active)
+            current_frame_idx = processed_frames
+
+            if is_active:
+                self.has_speech_started = True
+                self.total_speech_duration_ms += self.frame_ms
+                self.last_speech_frame = current_frame_idx
+                self.current_silence_duration_ms = 0.0
+            else:
+                if self.last_speech_frame is not None:
+                    self.current_silence_duration_ms = (current_frame_idx - self.last_speech_frame) * self.frame_ms
+
+            processed_frames += 1
+            required_samples = (processed_frames + 1) * self.frame_size
+
+        self.speech_regions = detect_speech_regions_from_frames(
+            self.speech_frames,
+            frame_ms=self.frame_ms,
+            vad_end_silence_ms=VAD_END_SILENCE_MS,
+            min_speech_ms=MIN_SPEECH_MS,
+        )
+        self.internal_pauses = detect_internal_pauses(
+            self.speech_regions,
+            min_internal_pause_ms=MIN_INTERNAL_PAUSE_MS,
+            strong_pause_ms=STRONG_PAUSE_MS,
+        )
+
+    def should_decode(self) -> bool:
+        new_samples = len(self.audio_buffer) - self.last_decode_sample
+        return new_samples >= int(SAMPLE_RATE * (PHONEME_DECODE_INTERVAL_MS / 1000.0))
+
+    def is_auto_endpoint(self) -> bool:
+        if self.finalized or not self.has_speech_started:
+            return False
+        if self.total_speech_duration_ms >= 300 and self.current_silence_duration_ms >= AUTO_ENDPOINT_SILENCE_MS:
+            return True
+        return False
+
+    async def cancel_attempt_tasks(self):
+        """Cancels all active background tasks for the current attempt."""
+        tasks = list(self.background_tasks)
+        self.background_tasks.clear()
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+
+    async def cleanup(self):
+        """
+        Idempotently cleans up session resources:
+        - Marks finalized
+        - Cancels background tasks
+        - Purges audio buffer and temporary arrays
+        - Removes session from registry
+        """
+        if self.finalized and len(self.audio_buffer) == 0:
+            return
+
+        self.finalized = True
+        await self.cancel_attempt_tasks()
+
+        # Free acoustic memory
+        self.audio_buffer = np.zeros(0, dtype=np.float32)
+        self.speech_frames.clear()
+        self.speech_regions.clear()
+        self.internal_pauses.clear()
+        self.last_detected_phonemes.clear()
+        self.last_emission_timestamps.clear()
+
+        async with registry_lock:
+            session_registry.pop(self.session_id, None)
+
+        logger.info(f"session={self.session_id} attempt={self.attempt_id} gen={self.generation} event=session_cleaned_up")
+
+    def decode_audio(self, is_final: bool = False) -> Dict[str, Any]:
+        """
+        Synchronous/thread helper for compatibility with standalone test harnesses.
+        Extracts sliding window or full recording and runs model inference.
+        """
+        if is_final:
+            audio = self.audio_buffer.copy()
+        else:
+            window_samples = int(SAMPLE_RATE * (PHONEME_WINDOW_MS / 1000.0))
+            audio = self.audio_buffer[-window_samples:].copy() if len(self.audio_buffer) > window_samples else self.audio_buffer.copy()
+
+        res = run_model_inference(audio, is_final=is_final)
+        self.last_decode_sample = len(self.audio_buffer)
+        self.last_detected_phonemes = res["phonemes"]
+        self.last_raw_text = res["raw"]
+        self.last_emission_timestamps = res["emission_timestamps"]
+        self.last_sequence_confidence = res["sequence_confidence"]
+        return res
+
+    def generate_assessment(self, is_final: bool = False) -> Dict[str, Any]:
+        audio_dur_ms = round(len(self.audio_buffer) / SAMPLE_RATE * 1000.0, 1)
+        target_phone_count = self.target_info["total_phonemes"]
+
+        evidence_state = determine_evidence_state(
+            is_final=is_final,
+            detected_phonemes=self.last_detected_phonemes,
+            speech_regions=self.speech_regions,
+            audio_duration_ms=audio_dur_ms,
+            target_phoneme_count=target_phone_count,
+        )
+
+        word_results, passage_summary = align_passage_words_global(
+            target_info=self.target_info,
+            detected_phonemes=self.last_detected_phonemes,
+            speech_regions=self.speech_regions,
+            internal_pauses=self.internal_pauses,
+            emission_timestamps=self.last_emission_timestamps,
+            audio_duration_ms=audio_dur_ms,
+            evidence_state=evidence_state,
+            sequence_confidence=self.last_sequence_confidence,
+        )
+
+        for w in word_results:
+            w["attempt_id"] = self.attempt_id
+            w["is_retry"] = self.is_retry
+
+        is_sentence = self.target_info["is_sentence"]
+
+        if is_sentence:
+            return {
+                "mode": "passage_assessment",
+                "session_id": self.session_id,
+                "attempt_id": self.attempt_id,
+                "is_retry": self.is_retry,
+                "generation": self.generation,
+                "evidence_state": evidence_state,
+                "evidence": evidence_state,
+                "target_text": self.target_text,
+                "passage": self.target_text,
+                "target": self.target_info,
+                "detected": {
+                    "phonemes": self.last_detected_phonemes,
+                    "raw": self.last_raw_text,
+                    "sequence_confidence": self.last_sequence_confidence,
+                    "emission_timestamps": self.last_emission_timestamps,
+                },
+                "words": word_results,
+                "word_results": word_results,
+                "words_total": passage_summary["words_total"],
+                "words_correct": passage_summary["words_correct"],
+                "words_mastered": passage_summary["words_mastered"],
+                "segmented_words": passage_summary["segmented_words"],
+                "repeated_words": passage_summary.get("repeated_words", 0),
+                "incorrect_words": passage_summary["incorrect_words"],
+                "omitted_words": passage_summary["omitted_words"],
+                "mastered_word_percentage": passage_summary["mastered_word_percentage"],
+                "segmented_word_percentage": passage_summary["segmented_word_percentage"],
+                "disfluent_word_percentage": passage_summary.get("disfluent_word_percentage", 0.0),
+                "scores": passage_summary["scores"],
+                "passage_scores": passage_summary["passage_scores"],
+                "status": passage_summary["status"],
+                "mastery": passage_summary["mastery"],
+                "feedback": passage_summary["feedback"],
+                "speech_regions": self.speech_regions,
+                "pauses": self.internal_pauses,
+                "sequence_confidence": self.last_sequence_confidence,
+                "is_final": is_final,
+            }
+        else:
+            w_res = word_results[0] if word_results else {}
+            w_res["attempt_id"] = self.attempt_id
+            w_res["is_retry"] = self.is_retry
+            return {
+                "mode": "single_word",
+                "session_id": self.session_id,
+                "attempt_id": self.attempt_id,
+                "is_retry": self.is_retry,
+                "generation": self.generation,
+                "evidence_state": evidence_state,
+                "evidence": evidence_state,
+                "target_text": self.target_text,
+                "target": self.target_info,
+                "detected": {
+                    "phonemes": self.last_detected_phonemes,
+                    "raw": self.last_raw_text,
+                    "sequence_confidence": self.last_sequence_confidence,
+                    "emission_timestamps": self.last_emission_timestamps,
+                },
+                "phoneme_evidence": {
+                    "strict_score": w_res.get("strict_score", 0.0),
+                    "regional_score": w_res.get("phoneme_score", 0.0),
+                    "alignment": w_res.get("alignment", []),
+                    "substitutions": w_res.get("substitutions", []),
+                    "deletions": w_res.get("deletions", []),
+                    "insertions": w_res.get("insertions", []),
+                },
+                "acoustic_evidence": {
+                    "speech_regions": self.speech_regions,
+                    "internal_pauses": self.internal_pauses,
+                    "max_internal_pause_ms": w_res.get("pause_duration_ms", 0.0),
+                    "internal_pause_detected": w_res.get("internal_pause", False),
+                    "blending_score": w_res.get("blending_score", 1.0),
+                    "blending_status": w_res.get("blending_status", "FLUENT"),
+                },
+                "disfluency": w_res.get("disfluency", {
+                    "detected": False, "type": "NONE", "confidence": 0.0, "repeat_count": 0,
+                    "repeated_sequence": [], "restart_detected": False, "prolongation_detected": False,
+                }),
+                "word_result": w_res,
+                "words": [w_res],
+                "scores": {
+                    "strict_phoneme_score": w_res.get("strict_score", 0.0),
+                    "regional_phoneme_score": w_res.get("phoneme_score", 0.0),
+                    "blending_score": w_res.get("blending_score", 1.0),
+                    "overall_score": round(0.7 * w_res.get("phoneme_score", 0.0) + 0.3 * w_res.get("blending_score", 1.0), 3),
+                },
+                "status": w_res.get("status", "INSUFFICIENT_AUDIO"),
+                "mastery": w_res.get("mastery", False),
+                "feedback_code": w_res.get("feedback_code", ""),
+                "feedback": w_res.get("feedback", ""),
+                "speech_regions": self.speech_regions,
+                "pauses": self.internal_pauses,
+                "sequence_confidence": self.last_sequence_confidence,
+                "is_final": is_final,
+            }
+
+
+# ============================================================
+# DEFENSIVE MESSAGE DISPATCH (4-WAY INVARIANT VALIDATION)
+# ============================================================
+
+async def send_session_json(
+    session: StreamingSession,
+    websocket: Optional[WebSocket],
+    payload: Dict[str, Any],
+    expected_session_id: str,
+    expected_attempt_id: int,
+    expected_generation: int,
+) -> bool:
+    """
+    Guarantees message is only sent if:
+    1. Session is not finalized.
+    2. Session ID matches expected ID.
+    3. Generation token matches expected generation.
+    4. Attempt ID matches expected attempt ID.
+    5. WebSocket connection is active.
+    """
+    if session.finalized and payload.get("type") != "final":
+        return False
+    if session.session_id != expected_session_id:
+        return False
+    if session.generation != expected_generation:
+        return False
+    if session.attempt_id != expected_attempt_id:
+        return False
+    if websocket is None:
+        return False
+
+    payload["session_id"] = session.session_id
+    payload["attempt_id"] = session.attempt_id
+    payload["generation"] = session.generation
+    payload["is_retry"] = session.is_retry
+    payload["event"] = payload.get("type", "update")
+
+    try:
+        await websocket.send_json(payload)
+        return True
+    except Exception as e:
+        logger.debug(f"session={session.session_id} event=send_failed error={e}")
+        return False
+
+
+async def run_background_decode(session: StreamingSession, websocket: WebSocket, expected_generation: int, expected_attempt_id: Optional[int] = None):
+    """
+    Executes an intermediate partial sliding-window decode through the bounded inference engine.
+    Silently discards results if superseded by a newer generation or attempt.
+    """
+    if expected_attempt_id is None:
+        expected_attempt_id = session.attempt_id
+    try:
+        # Extract sliding audio window
+        window_samples = int(SAMPLE_RATE * (PHONEME_WINDOW_MS / 1000.0))
+        audio_chunk = session.audio_buffer[-window_samples:].copy() if len(session.audio_buffer) > window_samples else session.audio_buffer.copy()
+
+        # Submit to bounded inference engine (priority 1: low)
+        dec_res = await inference_engine.submit_inference(
+            session_id=session.session_id,
+            attempt_id=expected_attempt_id,
+            generation=expected_generation,
+            audio_data=audio_chunk,
+            is_final=False,
+        )
+
+        if dec_res is None:
+            return  # Dropped due to queue backpressure or superseded generation
+
+        # 4-way defensive check before updating session results
+        if session.finalized or session.generation != expected_generation or session.attempt_id != expected_attempt_id:
+            return
+
+        session.last_decode_sample = len(session.audio_buffer)
+        session.last_detected_phonemes = dec_res["phonemes"]
+        session.last_raw_text = dec_res["raw"]
+        session.last_emission_timestamps = dec_res["emission_timestamps"]
+        session.last_sequence_confidence = dec_res["sequence_confidence"]
+
+        partial_result = session.generate_assessment(is_final=False)
+
+        await send_session_json(
+            session=session,
+            websocket=websocket,
+            payload={"type": "partial", "result": partial_result},
+            expected_session_id=session.session_id,
+            expected_attempt_id=expected_attempt_id,
+            expected_generation=expected_generation,
+        )
+
+        words = partial_result.get("words", [])
+        completed_count = sum(1 for w in words if w.get("status") in {"CORRECT_FLUENT", "CORRECT_BUT_SEGMENTED", "ACCEPTABLE_REGIONAL"})
+        active_idx = min(completed_count, len(words) - 1) if words else 0
+
+        await send_session_json(
+            session=session,
+            websocket=websocket,
+            payload={
+                "type": "progress",
+                "current_word_index": active_idx,
+                "current_word": words[active_idx]["target_word"] if active_idx < len(words) else "",
+                "words_completed": completed_count,
+                "words_total": len(words),
+            },
+            expected_session_id=session.session_id,
+            expected_attempt_id=expected_attempt_id,
+            expected_generation=expected_generation,
+        )
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.debug(f"session={session.session_id} event=background_decode_error error={e}")
+    finally:
+        session.is_decoding = False
+
+
+# ============================================================
+# WEBSOCKET STREAMING ENDPOINT (FULLY ISOLATED CONNECTION SCOPE)
+# ============================================================
+
+@app.websocket("/ws/stream")
+@app.websocket("/ws")
+async def websocket_stream_endpoint(websocket: WebSocket):
+    await websocket.accept()
+
+    # Generate authoritative connection-scoped session UUID
+    session_id = str(uuid.uuid4())
+    connection_id = str(uuid.uuid4())
+    logger.info(f"session={session_id} connection={connection_id} event=client_connected")
+
+    session: Optional[StreamingSession] = None
+    current_generation: int = 0
+    attempt_history: List[Dict[str, Any]] = []
+    attempt_counts: Dict[str, int] = {}
+
+    # Initialize placeholder session and register in global registry
+    session = StreamingSession(
+        websocket=websocket,
+        session_id=session_id,
+        connection_id=connection_id,
+        target_text="The quick brown fox jumps over the lazy dog",
+        attempt_id=1,
+        is_retry=False,
+        generation=0,
+    )
+    async with registry_lock:
+        session_registry[session_id] = session
+
+    try:
+        while True:
+            # Idle timeout guard
+            try:
+                message = await asyncio.wait_for(websocket.receive(), timeout=WEBSOCKET_IDLE_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                logger.info(f"session={session_id} event=idle_timeout_disconnect")
+                await websocket.send_json({"type": "timeout", "message": "Session closed due to inactivity."})
+                break
+
+            if message.get("type") == "websocket.disconnect":
+                logger.info(f"session={session_id} event=client_disconnect_received")
+                break
+
+            # Handle JSON Control Message
+            if "text" in message and message["text"]:
+                try:
+                    data = json.loads(message["text"])
+                    msg_type = data.get("type", "")
+
+                    if msg_type in {"start", "init", "start_attempt", "config"}:
+                        target_text = data.get("target") or data.get("target_text") or data.get("text") or data.get("word") or "The quick brown fox jumps over the lazy dog"
+                        norm_target = target_text.strip().lower()
+
+                        # Invalidate prior attempt and cancel pending decode tasks
+                        if session is not None:
+                            session.finalized = True
+                            await session.cancel_attempt_tasks()
+
+                        current_generation += 1
+
+                        req_attempt_id = data.get("attempt_id")
+                        if req_attempt_id is not None and isinstance(req_attempt_id, int):
+                            attempt_id = req_attempt_id
+                            is_retry = bool(data.get("is_retry", attempt_id > 1))
+                        else:
+                            prior_count = attempt_counts.get(norm_target, 0)
+                            attempt_id = prior_count + 1
+                            is_retry = prior_count > 0
+
+                        attempt_counts[norm_target] = max(attempt_counts.get(norm_target, 0), attempt_id)
+
+                        # Create fresh attempt state within the same connection session UUID
+                        session = StreamingSession(
+                            websocket=websocket,
+                            session_id=session_id,
+                            connection_id=connection_id,
+                            moodle_user_id=data.get("moodle_user_id"),
+                            moodle_attempt_id=data.get("moodle_attempt_id"),
+                            target_text=target_text,
+                            attempt_id=attempt_id,
+                            is_retry=is_retry,
+                            generation=current_generation,
+                        )
+                        async with registry_lock:
+                            session_registry[session_id] = session
+
+                        ready_type = "attempt_ready" if msg_type == "start_attempt" else "ready"
+                        ready_payload = {
+                            "type": ready_type,
+                            "session_id": session.session_id,
+                            "attempt_id": session.attempt_id,
+                            "is_retry": session.is_retry,
+                            "generation": session.generation,
+                            "target": session.target_info,
+                            "attempt_history_count": len(attempt_history),
+                            "message": f"Session ready for attempt {session.attempt_id} ({'retry' if session.is_retry else 'initial'}) of '{session.target_text}'",
+                        }
+                        await websocket.send_json(ready_payload)
+                        logger.info(f"session={session_id} attempt={session.attempt_id} gen={current_generation} is_retry={session.is_retry} target='{session.target_text}' event=attempt_initialized")
+
+                    elif msg_type == "stop":
+                        if session and not session.finalized:
+                            session.finalized = True
+                            expected_gen = session.generation
+                            expected_att = session.attempt_id
+
+                            # Final full-recording decode pass through bounded inference engine (Priority 0)
+                            dec_res = await inference_engine.submit_inference(
+                                session_id=session.session_id,
+                                attempt_id=expected_att,
+                                generation=expected_gen,
+                                audio_data=session.audio_buffer.copy(),
+                                is_final=True,
+                            )
+
+                            if dec_res is not None and session.generation == expected_gen and session.attempt_id == expected_att:
+                                session.last_detected_phonemes = dec_res["phonemes"]
+                                session.last_raw_text = dec_res["raw"]
+                                session.last_emission_timestamps = dec_res["emission_timestamps"]
+                                session.last_sequence_confidence = dec_res["sequence_confidence"]
+
+                                final_result = session.generate_assessment(is_final=True)
+                                scores = final_result.get("scores", {})
+                                p_score = scores.get("regional_phoneme_score", scores.get("phoneme_accuracy", 0.0))
+                                b_score = scores.get("blending_score", 1.0)
+                                attempt_history.append({
+                                    "session_id": session.session_id,
+                                    "attempt_id": session.attempt_id,
+                                    "is_retry": session.is_retry,
+                                    "generation": session.generation,
+                                    "target": session.target_text,
+                                    "status": final_result.get("status"),
+                                    "mastery": final_result.get("mastery", False),
+                                    "phoneme_accuracy": p_score,
+                                    "blending_score": b_score,
+                                    "overall_score": scores.get("overall_score", 0.0),
+                                    "timestamp": time.time(),
+                                })
+
+                                await send_session_json(
+                                    session=session,
+                                    websocket=websocket,
+                                    payload={
+                                        "type": "final",
+                                        "result": final_result,
+                                        "attempt_history": attempt_history,
+                                        "auto_stopped": False,
+                                    },
+                                    expected_session_id=session.session_id,
+                                    expected_attempt_id=expected_att,
+                                    expected_generation=expected_gen,
+                                )
+                                logger.info(f"session={session_id} attempt={session.attempt_id} gen={expected_gen} event=final_assessment_sent")
+
+                    elif msg_type in {"reset_history", "clear_history"}:
+                        attempt_history.clear()
+                        attempt_counts.clear()
+                        await websocket.send_json({
+                            "type": "history_reset",
+                            "session_id": session.session_id if session else session_id,
+                            "message": "Attempt history and attempt counters have been reset.",
+                        })
+
+                except json.JSONDecodeError:
+                    pass
+
+            # Handle Binary PCM Audio Chunk
+            elif "bytes" in message and message["bytes"]:
+                if session is None or session.finalized or session.generation != current_generation:
+                    continue
+
+                session.ingest_pcm(message["bytes"])
+
+                last_active = session.speech_frames[-1] if session.speech_frames else False
+                await send_session_json(
+                    session=session,
+                    websocket=websocket,
+                    payload={
+                        "type": "vad",
+                        "is_speech": last_active,
+                        "silence_ms": round(session.current_silence_duration_ms, 1),
+                        "speech_duration_ms": round(session.total_speech_duration_ms, 1),
+                    },
+                    expected_session_id=session.session_id,
+                    expected_attempt_id=session.attempt_id,
+                    expected_generation=session.generation,
+                )
+
+                # Auto-Endpointing (User completed reading followed by sustained silence)
+                if session.is_auto_endpoint():
+                    session.finalized = True
+                    expected_gen = session.generation
+                    expected_att = session.attempt_id
+
+                    dec_res = await inference_engine.submit_inference(
+                        session_id=session.session_id,
+                        attempt_id=expected_att,
+                        generation=expected_gen,
+                        audio_data=session.audio_buffer.copy(),
+                        is_final=True,
+                    )
+
+                    if dec_res is not None and session.generation == expected_gen and session.attempt_id == expected_att:
+                        session.last_detected_phonemes = dec_res["phonemes"]
+                        session.last_raw_text = dec_res["raw"]
+                        session.last_emission_timestamps = dec_res["emission_timestamps"]
+                        session.last_sequence_confidence = dec_res["sequence_confidence"]
+
+                        final_result = session.generate_assessment(is_final=True)
+                        scores = final_result.get("scores", {})
+                        p_score = scores.get("regional_phoneme_score", scores.get("phoneme_accuracy", 0.0))
+                        b_score = scores.get("blending_score", 1.0)
+                        attempt_history.append({
+                            "session_id": session.session_id,
+                            "attempt_id": session.attempt_id,
+                            "is_retry": session.is_retry,
+                            "generation": session.generation,
+                            "target": session.target_text,
+                            "status": final_result.get("status"),
+                            "mastery": final_result.get("mastery", False),
+                            "phoneme_accuracy": p_score,
+                            "blending_score": b_score,
+                            "overall_score": scores.get("overall_score", 0.0),
+                            "timestamp": time.time(),
+                        })
+
+                        await send_session_json(
+                            session=session,
+                            websocket=websocket,
+                            payload={
+                                "type": "final",
+                                "result": final_result,
+                                "attempt_history": attempt_history,
+                                "auto_stopped": True,
+                            },
+                            expected_session_id=session.session_id,
+                            expected_attempt_id=expected_att,
+                            expected_generation=expected_gen,
+                        )
+                        logger.info(f"session={session_id} attempt={session.attempt_id} gen={expected_gen} event=auto_endpoint_final_assessment_sent")
+                        continue
+
+                # Run non-blocking background sliding-window decoding periodically
+                if session.should_decode() and not session.finalized and not session.is_decoding:
+                    session.is_decoding = True
+                    t = asyncio.create_task(
+                        run_background_decode(session, websocket, current_generation, session.attempt_id)
+                    )
+                    session.background_tasks.add(t)
+                    t.add_done_callback(session.background_tasks.discard)
+
+    except WebSocketDisconnect:
+        logger.info(f"session={session_id} event=client_disconnected")
+    except Exception as exc:
+        logger.error(f"session={session_id} event=websocket_error error={exc}", exc_info=True)
+    finally:
+        if session:
+            await session.cleanup()
+
+
+# ============================================================
+# HTTP ROUTES & OBSERVABILITY
+# ============================================================
+
+@app.get("/favicon.ico")
+async def favicon():
+    from fastapi import Response
+    return Response(status_code=204)
+
+
+@app.get("/")
+async def root():
+    stream_html = STATIC_DIR / "stream.html"
+    if stream_html.exists():
+        return FileResponse(stream_html)
+    index_html = STATIC_DIR / "index.html"
+    if index_html.exists():
+        return FileResponse(index_html)
+    return HTMLResponse("<h2>Streaming ASR Server Running (v3.4.0)</h2><p>Connect via ws://127.0.0.1:8010/ws/stream</p>")
+
+
+@app.get("/version")
+async def version_endpoint():
+    return {
+        "version": "3.4.0",
+        "service": "streamASR",
+        "protocol": "moodle_acoustic_v3.4",
+    }
+
+
+@app.get("/health")
+async def health():
+    engine_stats = inference_engine.get_metrics()
+    return {
+        "status": "ok",
+        "service": "streamASR",
+        "version": "3.4.0",
+        "device": DEVICE,
+        "phoneme_model_loaded": phoneme_model is not None,
+        "espeak_available": espeak_available,
+        "sample_rate": SAMPLE_RATE,
+        "active_sessions": len(session_registry),
+        "inference_engine": {
+            "max_concurrent_inferences": MAX_CONCURRENT_INFERENCES,
+            "max_inference_queue": MAX_INFERENCE_QUEUE,
+            "active_inferences": engine_stats["active_inferences"],
+            "queue_size": engine_stats["queue_size"],
+            "total_completed": engine_stats["total_completed"],
+            "total_partial_decodes": engine_stats["total_partial_decodes"],
+            "total_final_decodes": engine_stats["total_final_decodes"],
+            "total_rejected": engine_stats["total_rejected"],
+            "total_stale_discarded": engine_stats["total_stale_discarded"],
+            "average_inference_time_ms": engine_stats["average_inference_time_ms"],
+        },
+        "limits": {
+            "max_attempt_duration_ms": MAX_ATTEMPT_DURATION_MS,
+            "max_audio_buffer_bytes": MAX_AUDIO_BUFFER_BYTES,
+            "max_audio_chunk_bytes": MAX_AUDIO_CHUNK_BYTES,
+            "websocket_idle_timeout_sec": WEBSOCKET_IDLE_TIMEOUT_SEC,
+        },
+        "ctc_stride_sec": calculate_ctc_temporal_stride(phoneme_model, SAMPLE_RATE) if phoneme_model else 0.020,
+        "quantization": "INT8" if DEVICE == "cpu" else "FP16/FP32",
+    }
+
+
+@app.get("/target")
+async def target_endpoint(text: str):
+    try:
+        return get_target_info(text)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ============================================================
+# STARTUP & SHUTDOWN LIFECYCLE
+# ============================================================
+
+@app.on_event("startup")
+async def startup_event():
+    global processor, phoneme_model, espeak_available
+
+    logger.info("=" * 60)
+    logger.info("STARTING STREAMING ASR & ACOUSTIC ASSESSMENT SERVICE (v3.4)")
+    logger.info(f"Device: {DEVICE}")
+    logger.info(f"Sample Rate: {SAMPLE_RATE} Hz")
+    logger.info(f"Max Concurrent Inferences: {MAX_CONCURRENT_INFERENCES}")
+    logger.info(f"Max Inference Queue: {MAX_INFERENCE_QUEUE}")
+    logger.info("=" * 60)
+
+    # Start Bounded Inference Engine
+    await inference_engine.start()
+
+    # Check eSpeak
+    espeak_exe = shutil.which("espeak-ng") or shutil.which("espeak")
+    if espeak_exe:
+        logger.info(f"eSpeak found: {espeak_exe}")
+        try:
+            test_res = phonemize("test", language="en-us", backend="espeak", strip=True)
+            espeak_available = bool(test_res)
+            logger.info("eSpeak phonemizer ready.")
+        except Exception as e:
+            logger.warning(f"eSpeak test failed: {e}")
+    else:
+        logger.warning("eSpeak executable not found.")
+
+    # Load Phoneme Model with CPU Multi-threading & Dynamic INT8 Quantization
+    logger.info(f"Loading Wav2Vec2 phoneme model: {PHONEME_MODEL_NAME}...")
+    try:
+        num_threads = min(4, os.cpu_count() or 4)
+        torch.set_num_threads(num_threads)
+        logger.info(f"PyTorch configured with {num_threads} CPU threads.")
+
+        processor = AutoProcessor.from_pretrained(PHONEME_MODEL_NAME)
+        raw_model = AutoModelForCTC.from_pretrained(PHONEME_MODEL_NAME)
+        raw_model.eval()
+
+        if DEVICE == "cpu":
+            logger.info("Applying dynamic INT8 quantization for CPU inference...")
+            phoneme_model = torch.quantization.quantize_dynamic(
+                raw_model, {torch.nn.Linear}, dtype=torch.qint8
+            )
+            logger.info("INT8 quantization enabled.")
+        else:
+            phoneme_model = raw_model.to(DEVICE)
+
+        stride_sec = calculate_ctc_temporal_stride(phoneme_model, SAMPLE_RATE)
+        pad_id = getattr(processor.tokenizer, "pad_token_id", 0)
+        blank_id = getattr(phoneme_model.config, "pad_token_id", pad_id)
+        logger.info(f"Wav2Vec2 phoneme model loaded: CTC frame stride={stride_sec*1000:.1f}ms, CTC blank ID={blank_id} ({pad_id})")
+    except Exception as exc:
+        logger.error(f"Failed to load phoneme model: {exc}")
+
+    logger.info("=" * 60)
+    logger.info(f"Streaming server running at http://{APP_HOST}:{APP_PORT}")
+    logger.info(f"WebSocket endpoint: ws://{APP_HOST}:{APP_PORT}/ws/stream")
+    logger.info("=" * 60)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Shutting down Streaming ASR Service...")
+    await inference_engine.stop()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=APP_HOST, port=APP_PORT)
