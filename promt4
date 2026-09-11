@@ -1,0 +1,288 @@
+fuck it need to live like it need immediate evaluation and has to detect stress pronouncitation and aware 
+
+
+
+make a promt 
+
+
+
+make another copy of this /var/www/andrew/mCopy/ dont include the mod.
+
+place it here  /var/www/andrew/mOFF/ make sure create a fresh db name it mOFF2_db add two user admin and student.
+
+create a another assement from the scratch dont use the opeai trancriber use only the tts in openAI api.
+
+ 
+
+facebook/wav2vec2-xlsr-53-espeak-cv-ft use this a transcriber make it ASR stream 
+
+just like /var/www/andrew/mCopy/mod/readingassessment/admin.php admin can install the dependendies in one click , and has a template(this contain installion script and setup make cross platform win/linux) too because i cant shipout the python venv.
+
+since it will be use by the multiple student make sure 
+
+
+ ADMIN SETTINGS 
+
+to add an AI/acoustic configuration section.
+
+
+
+Include settings such as:
+
+Acoustic AI enabled
+Acoustic engine
+Wav2Vec2 model
+Execution device
+CPU/GPU automatic detection
+Maximum concurrent inference
+Maximum inference queue
+Maximum audio duration
+Partial/live acoustic analysis
+Final acoustic analysis
+
+The exact Moodle setting API should follow the existing plugin coding style.
+
+
+
+Do not break existing admin settings.
+
+EXECUTION DEVICE MODES
+
+Provide:
+
+AUTO
+CPU
+CUDA
+
+Behavior:
+
+AUTO
+
+Automatically detect:
+
+torch.cuda.is_available()
+
+and use CUDA when properly available.
+
+
+
+Otherwise:
+
+CPU
+
+CPU
+
+Force CPU.
+
+CUDA
+
+Force CUDA, but provide a clear configuration/error state if CUDA is unavailable.
+
+
+
+Do NOT silently claim GPU mode when the model is actually running on CPU.
+
+12. ADMIN STATUS DISPLAY
+
+The Moodle administrator should be able to see something like:
+
+Acoustic AI
+----------------------------
+Status: Enabled
+
+Model:
+facebook/wav2vec2-xlsr-53-espeak-cv-ft
+
+Detected device:
+CPU
+
+Execution device:
+AUTO → CPU
+
+CUDA available:
+No
+
+Model loaded:
+Yes
+
+Maximum concurrent inference:
+2
+
+Inference queue:
+0 / 10
+
+If GPU exists:
+
+Detected device:
+NVIDIA GPU
+
+CUDA:
+Available
+
+Execution device:
+AUTO → CUDA
+
+Do not expose sensitive student data here.
+
+13. DEVICE DETECTION MUST HAPPEN SERVER-SIDE
+
+Do NOT use JavaScript such as:
+
+navigator.gpu
+
+to determine where Wav2Vec2 runs.
+
+
+
+The browser GPU is irrelevant to the Python AI process.
+
+
+
+The server-side Python environment must determine:
+
+torch.cuda.is_available()
+
+and inspect the available CUDA device if appropriate.
+
+
+
+The admin UI should display the server-side AI hardware.
+
+ CPU OPTIMIZATION
+
+When running CPU-only, optimize the Wav2Vec2 inference path.
+
+
+
+Inspect the existing streamASR.py implementation.
+
+
+
+Use appropriate:
+
+model.eval()
+torch.inference_mode()
+
+and CPU optimizations where safe.
+
+
+
+If dynamic quantization is used, preserve it only if it actually works with this model and measure it.
+
+
+
+Do NOT claim a performance improvement unless benchmarked.
+
+
+
+Make CPU worker/concurrency settings configurable.
+
+15. GPU OPTIMIZATION
+
+When CUDA is selected and available:
+
+model.to("cuda")
+
+and ensure input tensors are moved to the same device.
+
+
+
+Use:
+
+torch.inference_mode()
+
+Avoid unnecessary CPU ↔ GPU copies.
+
+
+
+Do not reload the model for every request.
+
+MULTI-USER ISOLATION
+
+This is mandatory.
+
+
+
+Multiple Moodle students may use the system simultaneously.
+
+
+
+Every student/session must have isolated:
+
+
+
+audio buffer
+
+VAD state
+
+phoneme output
+
+timestamps
+
+target word
+
+attempt ID
+
+retry state
+
+generation
+
+disfluency state
+
+assessment result
+
+
+
+Never use a global mutable audio/session variable.
+
+
+
+The model may be shared.
+
+
+
+Student state may NOT be shared.
+
+
+
+and 
+
+
+
+CONCURRENT USERS
+
+The acoustic engine must support multiple simultaneous Moodle users.
+
+
+
+Do NOT create unlimited Wav2Vec2 inference threads.
+
+
+
+Use a bounded inference queue.
+
+
+
+Example:
+
+Moodle user A ─┐
+Moodle user B ─┤
+Moodle user C ─┼──► bounded queue ──► CPU/GPU inference workers
+Moodle user D ─┤
+Moodle user E ─┘
+
+Admin-configurable:
+
+MAX_CONCURRENT_INFERENCES
+MAX_INFERENCE_QUEUE
+
+Final assessments should have higher priority than optional partial/live inference.
+
+after the student take the assement prepare by teacher make sure they can see the result analytics like  Reading accuracy = (Words – Miscues) ÷ Words × 100,Comprehension = (Correct Answers ÷ Questions) × 100, Reading Speed = (Words Read ÷ Time in Seconds) × 60
+
+AND also student can see there progress and teacher also since facebook/wav2vec2-xlsr-53-espeak-cv-ft has phoneme level detection make sure it seen in the progress
+
+
+
+
+make the looklike 
