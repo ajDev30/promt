@@ -1,4 +1,4 @@
-my external_assesment.js
+my js/external_assesment.js
 
 window.ExternalReadingAssessment = (function() {
     let config = {
