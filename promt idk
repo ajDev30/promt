@@ -1,0 +1,2263 @@
+my external_assesment.js
+
+window.ExternalReadingAssessment = (function() {
+    let config = {
+        token: '',
+        passage: '',
+        questions: [],
+        wwwroot: '',
+        asr_service_url: 'http://localhost:8010'
+    };
+
+    let ws = null;
+    let audioContext = null;
+    let processorNode = null;
+    let microphoneStream = null;
+    let isRecording = false;
+    let liveTranscript = "";
+    let heldEvaluationData = null;
+    let readingStartTime = null;
+    let prevPartialWords = [];
+    let currentPassageIndex = 0;
+    let noMatchCount = 0;
+    let totalMiscuesCount = 0;
+    
+    let mainAudioRecorder = null;
+    let mainAudioChunks = [];
+    let finalAudioBlob = null;
+    let readingEndTime = null;
+    
+    // Coach Mode State
+    let coachTimer = null;
+    let isCoachSpeaking = false;
+    let isIsolatedMode = false;
+    let coachWs = null;
+    let coachModeTargetIndex = -1;
+
+    function resetCoachTimer() { return;
+        if (coachTimer) clearTimeout(coachTimer);
+        if (currentPassageIndex < passageTokens.length) {
+            // Trigger coach if stuck for 15 seconds on the same word
+            coachTimer = setTimeout(() => window.triggerCoachMode(), 15000);
+        }
+    }
+
+    let currentCoachWord = "";
+    let cachedCoachAudio = null;
+
+    window.playCurrentCoachWord = async function() { return;
+        if (!currentCoachWord) return;
+        
+        const fallbackTTS = () => {
+            if ('speechSynthesis' in window) {
+                const utterance = new SpeechSynthesisUtterance(currentCoachWord);
+                utterance.lang = 'en-US';
+                utterance.rate = 0.85;
+                window.speechSynthesis.speak(utterance);
+            }
+        };
+
+        try {
+            const resp = await fetch(`${config.asr_service_url || "http://localhost:8010"}/tts_phoneme_guide`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text: currentCoachWord, voice: "en-US-JennyNeural" })
+            });
+            const data = await resp.json();
+            if (data && data.audio) {
+                cachedCoachAudio = new Audio(data.audio);
+                cachedCoachAudio.play().catch(e => fallbackTTS());
+                return;
+            } else {
+                fallbackTTS();
+            }
+        } catch(e) {
+            fallbackTTS();
+        }
+    };
+
+    window.forceDismissCoachMode = function() {
+        if (!isIsolatedMode) return;
+        
+        if (window._coachStopTimeout) {
+            clearTimeout(window._coachStopTimeout);
+            window._coachStopTimeout = null;
+        }
+
+        const card = document.getElementById("ra-isolation-card");
+        if (card) card.style.display = "none";
+        
+        isIsolatedMode = false;
+        if (mainAudioRecorder && mainAudioRecorder.state === 'paused') {
+            mainAudioRecorder.resume();
+        }
+        
+        if (coachWs) {
+            try { coachWs.close(); } catch(e){}
+            coachWs = null;
+        }
+
+        if (currentPassageIndex === coachModeTargetIndex) {
+            currentPassageIndex++;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "sync_index", index: currentPassageIndex }));
+            }
+        }
+        
+        noMatchCount = 0;
+        resetCoachTimer();
+    };
+
+    window.triggerCoachMode = async function(forceIndex = -1) { return;
+        let indexToCoach = forceIndex >= 0 ? forceIndex : currentPassageIndex;
+        coachModeTargetIndex = indexToCoach;
+        if (indexToCoach >= passageTokens.length || isIsolatedMode || !isRecording) return;
+        
+        totalMiscuesCount++; // Count as Phil-IRI error
+
+        let targetWord = passageTokens[indexToCoach].replace(/[.,\/#!$%\^&\*;:{}=\-_`~()"'?!]/g,"");
+        if (!targetWord) {
+            if (forceIndex === -1) currentPassageIndex++;
+            resetCoachTimer();
+            return;
+        }
+
+        isIsolatedMode = true;
+        if (mainAudioRecorder && mainAudioRecorder.state === 'recording') {
+            mainAudioRecorder.pause();
+        }
+        isCoachSpeaking = true;
+        currentCoachWord = targetWord;
+        cachedCoachAudio = null;
+
+        // Initialize Coach Azure WebSocket
+        const wsUrl = getWsUrl(config.asr_service_url);
+        coachWs = new WebSocket(wsUrl);
+        coachWs.onopen = () => {
+            coachWs.send(JSON.stringify({ type: "start", target: targetWord, attempt_id: 1 }));
+        };
+        coachWs.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                
+                if (msg.type === "partial" && msg.result) {
+                    const trans = document.getElementById("ra-iso-transcript");
+                    const heardText = msg.result.text || "";
+                    if (trans) trans.textContent = "(Heard: " + heardText + ")";
+
+                    // If the user keeps reading without pausing, Azure won't send a final chunk.
+                    // We detect if they said the target word in the partial stream and force Azure to finalize.
+                    if (currentCoachWord) {
+                        let cleanHeard = heardText.toLowerCase().replace(/[.,\/#!$%\^&\*;:{}=\-_`~()"'?!]/g,"");
+                        let cleanTarget = currentCoachWord.toLowerCase().replace(/[.,\/#!$%\^&\*;:{}=\-_`~()"'?!]/g,"");
+                        if (cleanHeard.includes(cleanTarget) || cleanHeard.split(/\s+/).includes(cleanTarget)) {
+                            if (coachWs && coachWs.readyState === WebSocket.OPEN && !window._coachStopTimeout) {
+                                // Add a 700ms delay to ensure they finish pronouncing the final syllables 
+                                // before we forcefully cut off the Azure audio buffer!
+                                window._coachStopTimeout = setTimeout(() => {
+                                    if (coachWs && coachWs.readyState === WebSocket.OPEN) {
+                                        coachWs.send(JSON.stringify({ type: "stop" }));
+                                    }
+                                    window._coachStopTimeout = null;
+                                }, 700);
+                            }
+                        }
+                    }
+                }
+
+                if (msg.type === "final" && msg.result) {
+                    if (window._coachStopTimeout) {
+                        clearTimeout(window._coachStopTimeout);
+                        window._coachStopTimeout = null;
+                    }
+                    const trans = document.getElementById("ra-iso-transcript");
+                    if (trans) trans.textContent = "(Listening...)";
+
+                    const wordResults = msg.result.words || msg.word_results || [];
+                    
+                    // Render in Coach Table
+                    const coachWordRow = document.getElementById("ra-coach-wordrow");
+                    const coachPhonemeRow = document.getElementById("ra-coach-phonemerow");
+                    const coachScoreRow = document.getElementById("ra-coach-scorerow");
+                    const pronunContainer = document.getElementById("ra-pronunciation-results");
+                    if (pronunContainer) pronunContainer.style.display = "block";
+
+                    if (coachWordRow && coachPhonemeRow && coachScoreRow && wordResults.length > 0) {
+                        let now = new Date();
+                        let timeStr = now.getHours() + ":" + String(now.getMinutes()).padStart(2, '0') + ":" + String(now.getSeconds()).padStart(2, '0');
+                        
+                        let tdwT = document.createElement('td');
+                        tdwT.innerText = "[" + timeStr + "]";
+                        tdwT.style.border = "1px solid lightgrey";
+                        tdwT.style.padding = "5px";
+                        tdwT.style.backgroundColor = "#f1f5f9";
+                        tdwT.style.fontWeight = "bold";
+                        coachWordRow.appendChild(tdwT);
+
+                        let tdpT = document.createElement('td'); tdpT.style.border = "1px solid lightgrey"; coachPhonemeRow.appendChild(tdpT);
+                        let tdsT = document.createElement('td'); tdsT.style.border = "1px solid lightgrey"; coachScoreRow.appendChild(tdsT);
+                    }
+
+                    let passed = false;
+                    let targetOmitted = false;
+                    wordResults.forEach(wr => {
+                        if (wr.error_type === "Omission") targetOmitted = true;
+                    });
+                    
+                    if (!targetOmitted) {
+                        wordResults.forEach(wr => {
+                            const err = wr.error_type || "None";
+                            const acc = wr.accuracy_score || 0;
+                            if (err === "None" && acc >= 60) {
+                                passed = true;
+                            }
+                        });
+                    }
+
+                    wordResults.forEach(wr => {
+                        const err = wr.error_type || "None";
+                        const acc = wr.accuracy_score || 0;
+                        const wordText = wr.word || "";
+                        
+                        if (coachWordRow && coachPhonemeRow && coachScoreRow && err !== "Insertion") {
+                            const phonemes = wr.phoneme_results || [];
+                            const countp = phonemes.length > 0 ? phonemes.length : 1;
+
+                            let tdw = document.createElement('td');
+                            tdw.innerText = wordText;
+                            let x = document.createElement("SUP");
+                            x.appendChild(document.createTextNode(Math.round(acc)));
+                            tdw.appendChild(x);
+                            tdw.colSpan = countp;
+                            tdw.style.border = "1px solid lightgrey";
+                            tdw.style.padding = "5px";
+                            if (err === "None" && acc >= 80) tdw.style.backgroundColor = "lightgreen";
+                            else tdw.style.backgroundColor = "#ff6b6b";  
+                            coachWordRow.appendChild(tdw);
+
+                            if (phonemes.length === 0) {
+                                let tdp = document.createElement('td'); tdp.style.border = "1px solid lightgrey"; coachPhonemeRow.appendChild(tdp);
+                                let tds = document.createElement('td'); tds.style.border = "1px solid lightgrey"; coachScoreRow.appendChild(tds);
+                            }
+
+                            phonemes.forEach(p => {
+                                let tdp = document.createElement('td');
+                                tdp.innerText = p.phoneme;
+                                tdp.style.border = "1px solid lightgrey";
+                                tdp.style.padding = "5px";
+                                let pAcc = p.accuracy || 0;
+                                if(pAcc >= 80) tdp.style.backgroundColor = "green";  
+                                else if(pAcc >= 60) tdp.style.backgroundColor = "lightgreen";  
+                                else if(pAcc >= 40) tdp.style.backgroundColor = "yellow";  
+                                else tdp.style.backgroundColor = "red"; 
+                                coachPhonemeRow.appendChild(tdp);
+
+                                let tds = document.createElement('td');
+                                tds.innerText = Math.round(pAcc);
+                                tds.style.border = "1px solid lightgrey";
+                                tds.style.padding = "5px";
+                                if(pAcc >= 80) tds.style.backgroundColor = "green";  
+                                else if(pAcc >= 60) tds.style.backgroundColor = "lightgreen";  
+                                else if(pAcc >= 40) tds.style.backgroundColor = "yellow";  
+                                else tds.style.backgroundColor = "red";
+                                coachScoreRow.appendChild(tds);
+                            });
+                        }
+                    });
+                    
+                    // Coach Mode Auto-Finalizer
+                    if (passed) {
+                        // Close Coach Mode and return to passage seamlessly
+                        window.forceDismissCoachMode();
+                    } else {
+                        // The attempt failed. If we manually sent "stop", the backend session is dead.
+                        // We must send "start" again to re-arm the Azure recognizer for the next attempt.
+                        if (coachWs && coachWs.readyState === WebSocket.OPEN) {
+                            coachWs.send(JSON.stringify({ type: "start", target: currentCoachWord, attempt_id: 2 }));
+                        }
+                    }
+                }
+            } catch(e){}
+        };
+        
+        // Visual indicator
+        const span = document.getElementById(`ra-ext-word-${currentPassageIndex}`);
+        if (span) {
+            span.style.backgroundColor = "#fef08a"; // yellow
+            span.style.color = "#854d0e";
+            span.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+
+        // Fetch Phonetics
+        let guide = { respelling: targetWord, ipa: `/${targetWord}/`, syllables: [targetWord] };
+        try {
+            const resp = await fetch(`${config.asr_service_url}/phoneme_analysis`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ word: targetWord })
+            });
+            if (resp.ok) {
+                const data = await resp.json();
+                if (data && data.word) guide = data;
+            }
+        } catch(e) {}
+
+        // Populate Card
+        const card = document.getElementById("ra-isolation-card");
+        if (card) {
+            document.getElementById("ra-iso-target-word").textContent = targetWord;
+            document.getElementById("ra-iso-phonetic").innerHTML = `Phonetic: <strong>[ ${guide.respelling || targetWord} ]</strong>`;
+            document.getElementById("ra-iso-ipa").innerHTML = `IPA: <strong>${guide.ipa || `/${targetWord}/`}</strong>`;
+            
+            let sylHtml = "";
+            let syllables = guide.syllables || [targetWord];
+            syllables.forEach((syl, idx) => {
+                sylHtml += `<span style="font-size: 2rem; font-weight: 800; background: white; padding: 10px 20px; border-radius: 12px; border: 2px solid #e2e8f0; color: #334155; cursor: pointer;" onclick="playCurrentCoachWord()">${syl}</span>`;
+                if (idx < syllables.length - 1) sylHtml += `<span style="font-size: 2rem; color: #94a3b8; align-self: center;">·</span>`;
+            });
+            document.getElementById("ra-iso-syllables").innerHTML = sylHtml;
+            card.style.display = "block";
+        }
+
+        // TTS auto-play once
+        playCurrentCoachWord();
+        isCoachSpeaking = false; 
+        if (coachTimer) clearTimeout(coachTimer); // pause timer until dismissed
+    };
+
+    function getWsUrl(asrServiceUrl) {
+        let url = asrServiceUrl || "http://localhost:8010";
+        if (url.startsWith("http://")) {
+            url = "ws://" + url.substring(7);
+        } else if (url.startsWith("https://")) {
+            url = "wss://" + url.substring(8);
+        } else {
+            url = "ws://" + url;
+        }
+        return url.replace(/\/+$/, "") + "/ws/stream";
+    }
+
+    async function stopRecording() {
+        if (coachTimer) clearTimeout(coachTimer);
+        isRecording = false;
+
+        if (mainAudioRecorder && mainAudioRecorder.state !== 'inactive') {
+            mainAudioRecorder.stop();
+        }
+
+        if (processorNode) {
+            processorNode.disconnect();
+            processorNode = null;
+        }
+        if (microphoneStream) {
+            microphoneStream.getTracks().forEach(t => t.stop());
+            microphoneStream = null;
+        }
+        if (audioContext) {
+            try { audioContext.close(); } catch(e) {}
+            audioContext = null;
+        }
+        if (ws) {
+            try {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: "stop" }));
+                }
+            } catch(e) {}
+        }
+    }
+
+    let passageTokens = [];
+    let currentLevel = 0;
+
+    function updateLevelUI() {
+        const passageBox = document.getElementById("ra-passage-text");
+        if (!passageBox) return;
+        
+        let rawText = (config.passages && config.passages[currentLevel]) ? config.passages[currentLevel] : "";
+        if (!rawText.trim()) {
+            passageBox.innerHTML = "<div class='alert alert-warning'>No passage configured for this level.</div>";
+            return;
+        }
+
+        const rawWords = rawText.split(/\s+/);
+        passageTokens = [];
+        let html = "";
+        rawWords.forEach((word, idx) => {
+            if (word.trim().length > 0) {
+                passageTokens.push(word);
+                html += `<span id="ra-ext-word-${idx}" style="transition: color 0.2s; display: inline-block; padding: 0 2px;">${word}</span> `;
+            }
+        });
+        passageBox.innerHTML = html;
+        
+        // Hide/Show questions for this level
+        config.questions.forEach((q, idx) => {
+            let qDiv = document.getElementById(`ra-q-container-${idx}`);
+            if (qDiv) {
+                let qLevel = parseInt(q.level_idx || 0);
+                if (qLevel === currentLevel) {
+                    qDiv.style.display = 'block';
+                } else {
+                    qDiv.style.display = 'none';
+                }
+            }
+        });
+    }
+
+    function resetAssessmentState() {
+        isRecording = false;
+        liveTranscript = "";
+        heldEvaluationData = null;
+        readingStartTime = null;
+        readingEndTime = null;
+        currentPassageIndex = 0;
+        noMatchCount = 0;
+        totalMiscuesCount = 0;
+        
+        const vadIndicator = document.getElementById("ra-vad-indicator");
+        if (vadIndicator) vadIndicator.classList.remove("ra-vad-active");
+        
+        const pronunContainer = document.getElementById("ra-pronunciation-results");
+        if (pronunContainer) pronunContainer.style.display = "none";
+        
+        const t = document.getElementById("ra-live-transcript");
+        if (t) t.innerText = "";
+        
+        const startBtn = document.getElementById("ra-btn-start");
+        if (startBtn) {
+            startBtn.disabled = false;
+            startBtn.classList.remove("btn-danger", "btn-warning");
+            startBtn.classList.add("btn-success");
+            
+            if (currentLevel === 3) {
+                startBtn.innerHTML = "🔊 Listen to Passage";
+                
+                // Hide mic components
+                const micSection = document.getElementById("ra-live-transcript")?.parentElement;
+                if (micSection) micSection.style.display = "none";
+            } else {
+                startBtn.innerHTML = "🎙️ Start Reading";
+                const micSection = document.getElementById("ra-live-transcript")?.parentElement;
+                if (micSection) micSection.style.display = "block";
+            }
+        }
+        
+        const submitBtn = document.getElementById("ra-btn-submit");
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = "Submit Results";
+        }
+        
+        updateLevelUI();
+    }
+
+    function init(cfg) {
+        Object.assign(config, cfg);
+        
+        if (config.starting_level !== undefined) {
+            currentLevel = config.starting_level;
+        }
+
+        const startBtn = document.getElementById("ra-btn-start");
+        const submitBtn = document.getElementById("ra-btn-submit");
+        const statusText = document.getElementById("ra-status-text");
+        const vadIndicator = document.getElementById("ra-vad-indicator");
+        const transcriptDisplay = document.getElementById("ra-live-transcript");
+        
+        updateLevelUI();
+
+        if (!startBtn) return;
+
+        startBtn.addEventListener("click", async () => {
+            if (currentLevel === 3) {
+                // Listening Comprehension Mode
+                startBtn.disabled = true;
+                startBtn.innerHTML = "🔊 Reading...";
+                statusText.textContent = "Please listen to the passage carefully...";
+                
+                startBtn.innerHTML = "✅ Finished Reading";
+                statusText.textContent = "You can now answer the questions below.";
+                if (submitBtn) submitBtn.disabled = false;
+                return;
+            }
+
+            if (!isRecording) {
+                try {
+                    statusText.textContent = "Requesting microphone access...";
+                    microphoneStream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            channelCount: 1,
+                            sampleRate: 16000,
+                            echoCancellation: true,
+                            noiseSuppression: true
+                        }
+                    });
+
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                    if (audioContext.state === 'suspended') {
+                        await audioContext.resume();
+                    }
+                    
+                    // 3-2-1 Countdown
+                    startBtn.disabled = true;
+                    startBtn.classList.remove("btn-success");
+                    startBtn.classList.add("btn-warning");
+                    for (let i = 3; i > 0; i--) {
+                        startBtn.innerHTML = `Starting in ${i}...`;
+                        statusText.innerHTML = `<span style="font-size: 1.2rem; font-weight: bold; color: #d97706;">Get ready... ${i}</span>`;
+                        await new Promise(r => setTimeout(r, 1000));
+                    }
+                    startBtn.disabled = false;
+                    startBtn.classList.remove("btn-warning");
+                    
+                    const source = audioContext.createMediaStreamSource(microphoneStream);
+                    processorNode = audioContext.createScriptProcessor(2048, 1, 1);
+
+                    const wsUrl = getWsUrl(config.asr_service_url);
+                    ws = new WebSocket(wsUrl);
+
+                    ws.onopen = () => {
+                        isRecording = true;
+                        startBtn.innerHTML = "⏹ Stop & Finish";
+                        startBtn.classList.remove("btn-success");
+                        startBtn.classList.add("btn-danger");
+                        statusText.textContent = "Recording active. Please read the passage aloud.";
+                        if (vadIndicator) vadIndicator.classList.add("ra-vad-active");
+                        liveTranscript = "";
+                        heldEvaluationData = null;
+                        readingStartTime = Date.now();
+                        prevPartialWords = [];
+                        currentPassageIndex = 0;
+                        noMatchCount = 0;
+                        resetCoachTimer();
+
+                        ws.send(JSON.stringify({
+                            type: "start",
+                            target: (config.passages && config.passages[currentLevel]) ? config.passages[currentLevel] : ""
+                        }));
+
+                        mainAudioChunks = [];
+                        finalAudioBlob = null;
+                        try {
+                            mainAudioRecorder = new MediaRecorder(microphoneStream);
+                            mainAudioRecorder.ondataavailable = function(evt) {
+                                if (evt.data && evt.data.size > 0) mainAudioChunks.push(evt.data);
+                            };
+                            mainAudioRecorder.onstop = function() {
+                                finalAudioBlob = new Blob(mainAudioChunks, { type: 'audio/webm' });
+                            };
+                            mainAudioRecorder.start();
+                        } catch(err) {
+                            console.warn("MediaRecorder not supported or failed to start", err);
+                        }
+
+                        processorNode.onaudioprocess = (e) => {
+                            if (!isRecording) return;
+                            
+                            const inputData = e.inputBuffer.getChannelData(0);
+                            const pcm16 = new Int16Array(inputData.length);
+                            for (let i = 0; i < inputData.length; i++) {
+                                let s = Math.max(-1, Math.min(1, inputData[i]));
+                                pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                            }
+                            
+                            if (isIsolatedMode) {
+                                if (coachWs && coachWs.readyState === WebSocket.OPEN) {
+                                    coachWs.send(pcm16.buffer);
+                                }
+                            } else {
+                                if (ws && ws.readyState === WebSocket.OPEN) {
+                                    ws.send(pcm16.buffer);
+                                }
+                            }
+                        };
+
+                        source.connect(processorNode);
+                        processorNode.connect(audioContext.destination);
+
+                        ws.onmessage = (event) => {
+                            try {
+                                const msg = JSON.parse(event.data);
+                                if (msg.type === "partial" || msg.type === "final") {
+                                    const res = msg.result || {};
+                                    const raw = res.detected ? res.detected.raw : (msg.text || "");
+                                    const wordResults = msg.words || res.words || msg.word_results || [];
+
+                                    if (msg.type === "final") {
+                                        liveTranscript += " " + raw;
+                                        if (res.scores) {
+                                            heldEvaluationData = { miscues: [], accuracy_score: res.scores.accuracy_score, comprehension_score: 0 };
+                                        }
+                                    }
+                                    
+                                    if (transcriptDisplay) transcriptDisplay.textContent = liveTranscript + (msg.type === "partial" ? " " + raw : "");
+
+                                    // Update word highlights based on Azure Pronunciation Assessment results
+                                    // Update word highlights and Results Table
+                                    if (wordResults.length > 0) {
+                                        const pronunContainer = document.getElementById("ra-pronunciation-results");
+                                        const wordRow = document.getElementById("ra-wordrow");
+                                        const phonemeRow = document.getElementById("ra-phonemerow");
+                                        const scoreRow = document.getElementById("ra-scorerow");
+
+                                        if (pronunContainer) {
+                                            pronunContainer.style.display = "block";
+                                            if (msg.type === "final") {
+                                                // Interim Phil-IRI Calculation
+                                                const wordsInPassage = passageTokens.length || 1;
+                                                const wordReadingScore = Math.max(0, ((wordsInPassage - totalMiscuesCount) / wordsInPassage) * 100);
+                                                document.getElementById("ra-summ-word-reading").innerText = Math.round(wordReadingScore) + "%";
+                                                
+                                                if (readingStartTime) {
+                                                    const rTimeSec = (Date.now() - readingStartTime) / 1000;
+                                                    const wpm = (wordsInPassage / rTimeSec) * 60;
+                                                    document.getElementById("ra-summ-wpm").innerText = Math.round(wpm);
+                                                }
+                                            }
+                                        }
+
+                                        if (wordRow && phonemeRow && scoreRow) {
+                                            // DO NOT clear innerHTML = "" so table stays and grows
+                                            // Add a timestamp column for this chunk
+                                            let elapsed = Math.floor((Date.now() - (readingStartTime || Date.now())) / 1000);
+                                            let timeStr = String(Math.floor(elapsed/60)).padStart(2,'0') + ":" + String(elapsed%60).padStart(2,'0');
+                                            
+                                            let tdwT = document.createElement('td');
+                                            tdwT.innerText = "[" + timeStr + "]";
+                                            tdwT.style.border = "1px solid lightgrey";
+                                            tdwT.style.padding = "5px";
+                                            tdwT.style.backgroundColor = "#f1f5f9";
+                                            tdwT.style.fontWeight = "bold";
+                                            wordRow.appendChild(tdwT);
+
+                                            let tdpT = document.createElement('td'); tdpT.style.border = "1px solid lightgrey"; phonemeRow.appendChild(tdpT);
+                                            let tdsT = document.createElement('td'); tdsT.style.border = "1px solid lightgrey"; scoreRow.appendChild(tdsT);
+                                        }
+
+                                        let foundMispronunciationIdx = -1;
+
+                                        wordResults.forEach((wr, idx) => {
+                                            let err = wr.error_type || "None";
+                                            const acc = wr.accuracy_score || 0;
+                                            
+                                            // Force low-scoring words to be treated as Mispronunciation even if Azure didn't flag them
+                                            if (err === "None" && acc < 60) {
+                                                err = "Mispronunciation";
+                                            }
+
+                                            let cleanWord = wordText.toLowerCase().replace(/[^\w]/g, "");
+                                            let passageIdx = -1;
+                                            
+                                            // Sliding window: first search forwards (up to 8 words)
+                                            for(let offset=0; offset<8; offset++){
+                                                let checkIdx = currentPassageIndex + offset;
+                                                if(checkIdx < passageTokens.length){
+                                                    let cleanPassage = passageTokens[checkIdx].toLowerCase().replace(/[^\w]/g, "");
+                                                    if(cleanPassage === cleanWord){
+                                                        passageIdx = checkIdx;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            
+                                            // If not found forward, search backwards (up to 15 words) in case they restarted a sentence
+                                            if (passageIdx === -1) {
+                                                for(let offset=1; offset<=15; offset++){
+                                                    let checkIdx = currentPassageIndex - offset;
+                                                    if(checkIdx >= 0){
+                                                        let cleanPassage = passageTokens[checkIdx].toLowerCase().replace(/[^\w]/g, "");
+                                                        if(cleanPassage === cleanWord){
+                                                            passageIdx = checkIdx;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            
+                                            if(passageIdx === -1){
+                                                passageIdx = currentPassageIndex; 
+                                            } else {
+                                                // Advance currentPassageIndex to the matched word's index + 1
+                                                currentPassageIndex = passageIdx + 1;
+                                            }
+                                            
+                                            if (err === "None") {
+                                                const s = document.getElementById(`ra-ext-word-${passageIdx}`);
+                                                if (s) {
+                                                    s.style.backgroundColor = "#e0f2fe"; 
+                                                    s.style.color = "#0369a1";
+                                                }
+                                                resetCoachTimer();
+                                                if (ws && ws.readyState === WebSocket.OPEN) {
+                                                    ws.send(JSON.stringify({ type: "sync_index", index: currentPassageIndex }));
+                                                }
+                                                
+                                                // Clear stutter flag if they eventually got it right
+                                                if (foundMispronunciationIdx === passageIdx) {
+                                                    foundMispronunciationIdx = -1;
+                                                }
+                                            }
+
+                                            // Trigger Coach Mode on the first miscue found in this chunk
+                                            if ((err === "Mispronunciation" || err === "Omission" || err === "Insertion") && foundMispronunciationIdx === -1) {
+                                                foundMispronunciationIdx = passageIdx;
+                                            }
+
+                                            // Highlight Passage Words
+                                            if (passageIdx < passageTokens.length) {
+                                                const span = document.getElementById(`ra-ext-word-${passageIdx}`);
+                                                if (span) {
+                                                    if (err === "None" || err === "Insertion") {
+                                                        span.style.color = "#059669"; // Green
+                                                        span.style.borderBottom = "2px solid #059669";
+                                                    } else if (err === "Mispronunciation") {
+                                                        span.style.color = "#d97706"; // Orange
+                                                        span.style.borderBottom = "2px solid #d97706";
+                                                    } else if (err === "Omission") {
+                                                        span.style.color = "#dc2626"; // Red
+                                                        span.style.borderBottom = "2px dashed #dc2626";
+                                                    }
+                                                }
+                                            }
+
+                                            // Auto-stop if they reached the end of the passage
+                                            if (isRecording && currentPassageIndex >= passageTokens.length) {
+                                                console.log("Auto-stopping, reached end of passage.");
+                                                stopRecording();
+                                            }
+
+                                            // Populate Detailed Table (only if we have the rows)
+                                            if (wordRow && phonemeRow && scoreRow) {
+                                                if (err === "Omission") {
+                                                    let tdw = document.createElement('td');
+                                                    tdw.innerText = wordText;
+                                                    tdw.style.backgroundColor = "orange"; 
+                                                    tdw.style.border = "1px solid lightgrey";
+                                                    tdw.style.padding = "5px";
+                                                    wordRow.appendChild(tdw);
+
+                                                    let tdp = document.createElement('td');
+                                                    tdp.innerText = "-";
+                                                    tdp.style.backgroundColor = "orange";
+                                                    tdp.style.border = "1px solid lightgrey";
+                                                    tdp.style.padding = "5px";
+                                                    phonemeRow.appendChild(tdp);
+
+                                                    let tds = document.createElement('td');
+                                                    tds.innerText = "-";
+                                                    tds.style.backgroundColor = "orange";
+                                                    tds.style.border = "1px solid lightgrey";
+                                                    tds.style.padding = "5px";
+                                                    scoreRow.appendChild(tds);
+                                                } else if (err === "None" || err === "Mispronunciation") {
+                                                    const phonemes = wr.phoneme_results || [];
+                                                    const countp = phonemes.length > 0 ? phonemes.length : 1;
+
+                                                    let tdw = document.createElement('td');
+                                                    tdw.innerText = wordText;
+                                                    let x = document.createElement("SUP");
+                                                    x.appendChild(document.createTextNode(Math.round(acc)));
+                                                    tdw.appendChild(x);
+                                                    tdw.colSpan = countp;
+                                                    tdw.style.border = "1px solid lightgrey";
+                                                    tdw.style.padding = "5px";
+                                                    if (err === "None" && acc >= 80) {
+                                                        tdw.style.backgroundColor = "lightgreen";
+                                                    } else {
+                                                        tdw.style.backgroundColor = "#ff6b6b";  
+                                                    }
+                                                    wordRow.appendChild(tdw);
+
+                                                    if (phonemes.length === 0) {
+                                                        let tdp = document.createElement('td'); tdp.style.border = "1px solid lightgrey"; phonemeRow.appendChild(tdp);
+                                                        let tds = document.createElement('td'); tds.style.border = "1px solid lightgrey"; scoreRow.appendChild(tds);
+                                                    }
+
+                                                    phonemes.forEach(p => {
+                                                        let tdp = document.createElement('td');
+                                                        tdp.innerText = p.phoneme;
+                                                        tdp.style.border = "1px solid lightgrey";
+                                                        tdp.style.padding = "5px";
+                                                        let pAcc = p.accuracy || 0;
+                                                        if(pAcc >= 80) tdp.style.backgroundColor = "green";  
+                                                        else if(pAcc >= 60) tdp.style.backgroundColor = "lightgreen";  
+                                                        else if(pAcc >= 40) tdp.style.backgroundColor = "yellow";  
+                                                        else tdp.style.backgroundColor = "red"; 
+                                                        phonemeRow.appendChild(tdp);
+
+                                                        let tds = document.createElement('td');
+                                                        tds.innerText = Math.round(pAcc);
+                                                        tds.style.border = "1px solid lightgrey";
+                                                        tds.style.padding = "5px";
+                                                        if(pAcc >= 80) tds.style.backgroundColor = "green";  
+                                                        else if(pAcc >= 60) tds.style.backgroundColor = "lightgreen";  
+                                                        else if(pAcc >= 40) tds.style.backgroundColor = "yellow";  
+                                                        else tds.style.backgroundColor = "red";
+                                                        scoreRow.appendChild(tds);
+                                                    });
+                                                }
+                                            }
+                                        });
+
+                                        if (foundMispronunciationIdx !== -1) {
+                                            window.triggerCoachMode(foundMispronunciationIdx);
+                                        }
+                                    }
+                                } else if (msg.type === "assessment_report") {
+                                    // Save the final perfectly calculated Azure sample scores and words
+                                    heldEvaluationData = heldEvaluationData || {};
+                                    heldEvaluationData.accuracy_score = msg.scores ? msg.scores.accuracy_score : 0;
+                                    heldEvaluationData.scores = msg.scores; // fluency, prosody, completeness
+                                        
+                                        // Collect the exact final Omissions, Insertions, etc for the backend!
+                                        const finalWords = msg.word_results || [];
+                                        heldEvaluationData.word_results = finalWords;
+                                        
+                                        let miscuesArr = [];
+                                        finalWords.forEach((wr, idx) => {
+                                            const et = wr.error_type || "None";
+                                            if (et !== "None") {
+                                                miscuesArr.push({
+                                                    word: wr.word || "",
+                                                    spoken_word: wr.spoken_word || "",
+                                                    error_type: et,
+                                                    accuracy_score: wr.accuracy_score || 0
+                                                });
+                                            }
+                                        });
+                                        heldEvaluationData.miscues = miscuesArr;
+                                        
+                                        // Update the summary UI with the final correct Phil-IRI word reading score
+                                        const wordsInPassage = passageTokens.length || 1;
+                                        const totalMiscuesFinal = miscuesArr.length;
+                                        const finalWordReadingScore = Math.max(0, ((wordsInPassage - totalMiscuesFinal) / wordsInPassage) * 100);
+                                        const summWordReading = document.getElementById("ra-summ-word-reading");
+                                        if (summWordReading) summWordReading.innerText = Math.round(finalWordReadingScore) + "%";
+                                    } else if (msg.type === "attempt_ready" || msg.type === "ready") {
+                                    console.log("Session ready:", msg.message);
+                                }
+                            } catch(e) {}
+                        };
+
+                        ws.onerror = (e) => {
+                            console.error("WebSocket error:", e);
+                            statusText.textContent = "Error: Connection to speech service failed.";
+                        };
+                    };
+
+                } catch (err) {
+                    statusText.textContent = "Microphone access denied or failed.";
+                    console.error(err);
+                }
+            } else {
+                await stopRecording();
+                startBtn.disabled = true;
+                startBtn.innerHTML = "Processing...";
+                statusText.textContent = "Processing speech... Please answer the questions below.";
+                if (vadIndicator) vadIndicator.classList.remove("ra-vad-active");
+                if (submitBtn) submitBtn.disabled = false;
+            }
+        });
+
+        if (submitBtn) {
+            submitBtn.addEventListener("click", async () => {
+                submitBtn.disabled = true;
+                submitBtn.innerHTML = "Submitting...";
+
+                let studentAnswers = {};
+                config.questions.forEach((q, idx) => {
+                    let qLevel = parseInt(q.level_idx || 0);
+                    if (qLevel !== currentLevel) return; // Only save answers for this level
+                    
+                    const qtype = q.type || 'multichoice';
+                    if (qtype === 'multichoice' || qtype === 'truefalse') {
+                        const checked = document.querySelector(`input[name="ra_q_${idx}"]:checked`);
+                        studentAnswers[idx] = checked ? checked.value : '';
+                    } else if (qtype === 'matching') {
+                        const pairs = q.pairs || [];
+                        let pairAns = {};
+                        pairs.forEach((p, pidx) => {
+                            const sel = document.querySelector(`select[name="ra_q_${idx}_p_${pidx}"]`);
+                            pairAns[pidx] = sel ? sel.value : '';
+                        });
+                        studentAnswers[idx] = pairAns;
+                    } else {
+                        const inp = document.querySelector(`input[name="ra_q_${idx}"]`) || document.querySelector(`textarea[name="ra_q_${idx}"]`);
+                        studentAnswers[idx] = inp ? inp.value : '';
+                    }
+                });
+
+                try {
+                    const evalData = heldEvaluationData || {};
+                    const miscuesList = evalData.miscues || [];
+                    const rTime = readingStartTime ? Math.round((Date.now() - readingStartTime)/1000) : 0;
+                    const wordsCount = passageTokens.length || 1;
+                    const rSpeed = rTime > 0 ? Math.round((wordsCount / rTime) * 60) : 0;
+                    const accuracy = evalData.accuracy_score || 0.0;
+
+                    const submitUrl = `${config.wwwroot}/mod/readingassessment/external_submit.php`;
+                    
+                    // Wait a tiny bit for MediaRecorder to fire its onstop event
+                    await new Promise(r => setTimeout(r, 600));
+
+                    const formData = new FormData();
+                    formData.append('token', config.token);
+                    formData.append('transcript', liveTranscript);
+                    formData.append('accuracy_score', accuracy);
+                    formData.append('reading_time', rTime);
+                    formData.append('reading_speed', rSpeed);
+                    formData.append('miscues_json', JSON.stringify(miscuesList));
+                    formData.append('evaluation_data', JSON.stringify(heldEvaluationData || {}));
+                    formData.append('total_miscues', totalMiscuesCount);
+                    formData.append('answers_json', JSON.stringify(studentAnswers));
+                    formData.append('level_idx', currentLevel);
+                    
+                    if (finalAudioBlob) {
+                        formData.append('audio_file', finalAudioBlob, 'attempt.webm');
+                    }
+
+                    const response = await fetch(submitUrl, {
+                        method: "POST",
+                        body: formData
+                    });
+
+                    const resData = await response.json();
+                    
+                    if (response.ok) {
+                        if (resData.classification === "Frustration" || resData.classification === "Non-Reader") {
+                            if (currentLevel < 3 && config.passages && config.passages[currentLevel + 1] && config.passages[currentLevel + 1].trim().length > 0) {
+                                // Step down to next passage
+                                alert("Let's try another passage! Please read the next text.");
+                                currentLevel++;
+                                resetAssessmentState();
+                                return;
+                            }
+                        }
+
+                        // No more levels or they passed, redirect to results page
+                        window.location.href = `${config.wwwroot}/mod/readingassessment/external_results.php?token=${config.token}`;
+                    } else {
+                        alert("Error submitting: " + (resData.error || "Unknown error"));
+                        submitBtn.disabled = false;
+                        submitBtn.innerHTML = "Submit Results";
+                    }
+
+                } catch (err) {
+                    console.error("Evaluation submission error:", err);
+                    alert("Error communicating with server.");
+                    submitBtn.disabled = false;
+                    submitBtn.innerHTML = "Submit Results";
+                }
+            });
+        }
+    }
+
+    return { init: init };
+})();
+
+my styles.css
+
+/* Reading Assessment Plugin Styles */
+.ra-container {
+    max-width: 900px;
+    margin: 20px auto;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+.ra-card {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 24px;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+}
+
+.ra-passage-box {
+    background-color: #f8fafc;
+    border: 2px solid #cbd5e1;
+    border-radius: 10px;
+    padding: 24px;
+    font-size: 1.35rem;
+    line-height: 2;
+    color: #1e293b;
+    margin-bottom: 20px;
+    user-select: none;
+}
+
+.ra-passage-text {
+    min-height: 120px;
+}
+
+.ra-controls {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+}
+
+.ra-btn {
+    padding: 10px 22px;
+    font-size: 1rem;
+    font-weight: 600;
+    border-radius: 8px;
+    border: none;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.2s ease;
+}
+
+.ra-btn-start {
+    background-color: #16a34a;
+    color: #ffffff;
+}
+
+.ra-btn-start:hover:not(:disabled) {
+    background-color: #15803d;
+}
+
+.ra-btn-done {
+    background-color: #ea580c;
+    color: #ffffff;
+    animation: pulse-border 1.5s infinite;
+}
+
+.ra-btn-done:hover:not(:disabled) {
+    background-color: #c2410c;
+}
+
+@keyframes pulse-border {
+    0% { box-shadow: 0 0 0 0 rgba(234, 88, 12, 0.4); }
+    70% { box-shadow: 0 0 0 8px rgba(234, 88, 12, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(234, 88, 12, 0); }
+}
+
+.ra-btn-retry {
+    background-color: #0284c7;
+    color: #ffffff;
+}
+
+.ra-btn-retry:hover:not(:disabled) {
+    background-color: #0369a1;
+}
+
+.ra-btn-submit {
+    background-color: #2563eb;
+    color: #ffffff;
+    font-size: 1.1rem;
+    padding: 12px 28px;
+}
+
+.ra-btn-submit:hover:not(:disabled) {
+    background-color: #1d4ed8;
+}
+
+.ra-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Instructional Reader Specific Styles */
+.ra-instructional-box {
+    background: #f8fafc;
+    border: 2px solid #3b82f6;
+    border-radius: 12px;
+    padding: 30px;
+    text-align: center;
+    margin-bottom: 24px;
+    position: relative;
+    overflow: hidden;
+}
+
+.ra-instructional-line {
+    font-size: 1.8rem;
+    font-weight: 600;
+    line-height: 2.2;
+    color: #1e293b;
+    margin: 20px 0;
+    transition: opacity 0.3s ease;
+}
+
+.ra-line-dimmed {
+    opacity: 0.15;
+    filter: blur(1px);
+    pointer-events: none;
+}
+
+.ra-inst-word {
+    display: inline-block;
+    padding: 4px 8px;
+    margin: 0 2px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.ra-inst-word:hover {
+    background-color: #e2e8f0;
+}
+
+.ra-inst-word-focus {
+    background-color: #fef08a !important;
+    border-bottom: 3px solid #ca8a04;
+    color: #854d0e;
+    transform: scale(1.08);
+}
+
+.ra-inst-word-read {
+    color: #94a3b8;
+}
+
+.ra-inst-word-good {
+    color: #16a34a !important;
+    font-weight: bold;
+}
+
+.ra-inst-word-miscue {
+    color: #dc2626 !important;
+    background-color: #fee2e2 !important;
+    border-bottom: 3px solid #b91c1c;
+}
+
+/* Google-Style & Progressive Cumulative Blending Card */
+.ra-isolation-card {
+    background: #ffffff;
+    border: 2px solid #3b82f6;
+    border-radius: 16px;
+    padding: 26px;
+    margin: 18px auto;
+    max-width: 620px;
+    box-shadow: 0 12px 30px -8px rgba(59, 130, 246, 0.25);
+    animation: fadeInScale 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    text-align: center;
+}
+
+@keyframes fadeInScale {
+    0% { transform: scale(0.92); opacity: 0; }
+    100% { transform: scale(1); opacity: 1; }
+}
+
+.ra-isolation-header {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: #1d4ed8;
+    margin-bottom: 8px;
+}
+
+/* 2x Mastery Check Badge */
+.ra-mastery-container {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    margin: 6px auto 10px;
+}
+
+.ra-mastery-chip {
+    background: #f1f5f9;
+    border: 1px solid #cbd5e1;
+    color: #475569;
+    font-size: 0.95rem;
+    font-weight: 700;
+    padding: 4px 14px;
+    border-radius: 20px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.3s ease;
+}
+
+.ra-mastery-chip-1x,
+.ra-mastery-chip-progress {
+    background: #fef3c7;
+    border-color: #f59e0b;
+    color: #b45309;
+    box-shadow: 0 0 8px rgba(245, 158, 11, 0.3);
+}
+
+.ra-mastery-chip-2x,
+.ra-mastery-chip-complete {
+    background: #dcfce7;
+    border-color: #22c55e;
+    color: #15803d;
+    box-shadow: 0 0 10px rgba(34, 197, 94, 0.4);
+    animation: masteryGlow 0.5s ease;
+}
+
+@keyframes masteryGlow {
+    0% { transform: scale(0.95); }
+    50% { transform: scale(1.1); }
+    100% { transform: scale(1); }
+}
+
+.ra-target-word-display {
+    font-size: 2.6rem;
+    font-weight: 800;
+    color: #0f172a;
+    letter-spacing: 0.5px;
+    margin: 6px 0;
+}
+
+.ra-phonetic-badge-container {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin: 8px 0 14px;
+    flex-wrap: wrap;
+}
+
+.ra-phonetic-respelling {
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    color: #1d4ed8;
+    font-size: 1.3rem;
+    font-weight: 700;
+    padding: 6px 16px;
+    border-radius: 20px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.ra-ipa-guide {
+    color: #64748b;
+    font-size: 1.15rem;
+    font-family: "Lucida Sans Unicode", "DejaVu Sans", "Segoe UI", sans-serif;
+    background: #f1f5f9;
+    padding: 6px 14px;
+    border-radius: 20px;
+    border: 1px solid #e2e8f0;
+}
+
+/* Interactive Syllable Tiles with Live Green / Red Highlights */
+.ra-syllable-container {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    margin: 14px 0 16px;
+    flex-wrap: wrap;
+}
+
+.ra-syllable-tile {
+    background: #eef2ff;
+    border: 2px solid #818cf8;
+    color: #3730a3;
+    font-size: 1.8rem;
+    font-weight: 800;
+    padding: 8px 18px;
+    border-radius: 10px;
+    cursor: pointer;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    user-select: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.ra-syllable-tile:hover {
+    background: #e0e7ff;
+    transform: translateY(-2px);
+}
+
+.ra-syllable-tile-focus {
+    background: #fef08a !important;
+    border-color: #ca8a04 !important;
+    color: #854d0e !important;
+    transform: scale(1.08);
+    box-shadow: 0 0 0 4px rgba(234, 179, 8, 0.25);
+}
+
+.ra-syllable-tile-good {
+    background: #dcfce7 !important;
+    border-color: #22c55e !important;
+    color: #15803d !important;
+    transform: scale(1.04);
+    box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.2);
+    animation: tilePulseGreen 0.4s ease;
+}
+
+@keyframes tilePulseGreen {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.15); }
+    100% { transform: scale(1.04); }
+}
+
+.ra-syllable-tile-miscue {
+    background: #fee2e2 !important;
+    border-color: #ef4444 !important;
+    color: #b91c1c !important;
+    box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.2);
+    animation: tileShakeRed 0.4s ease;
+}
+
+@keyframes tileShakeRed {
+    0%, 100% { transform: translateX(0); }
+    20%, 60% { transform: translateX(-6px); }
+    40%, 80% { transform: translateX(6px); }
+}
+
+.ra-syllable-divider {
+    font-size: 2rem;
+    color: #cbd5e1;
+    font-weight: bold;
+}
+
+/* Progressive Cumulative Sound-Out Steps */
+.ra-blending-steps-container {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 16px;
+    margin: 14px 0 18px;
+    text-align: left;
+}
+
+.ra-blending-step-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    margin-bottom: 6px;
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    transition: all 0.2s ease;
+    cursor: pointer;
+}
+
+.ra-blending-step-row:hover {
+    background: #eef2ff;
+    border-color: #818cf8;
+    transform: translateX(4px);
+}
+
+.ra-step-badge {
+    background: #e0f2fe;
+    color: #0369a1;
+    font-weight: 700;
+    font-size: 0.85rem;
+    padding: 4px 10px;
+    border-radius: 12px;
+}
+
+.ra-step-formula {
+    font-size: 1.15rem;
+    font-weight: 600;
+    color: #1e293b;
+}
+
+.ra-step-sound-btn {
+    background: #f1f5f9;
+    border: 1px solid #cbd5e1;
+    color: #3b82f6;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.ra-blending-actions {
+    display: flex;
+    justify-content: center;
+    gap: 12px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+}
+
+.ra-listen-btn {
+    background: #3b82f6;
+    color: #ffffff;
+    border: none;
+    padding: 10px 20px;
+    font-size: 1rem;
+    font-weight: 700;
+    border-radius: 24px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    box-shadow: 0 4px 10px rgba(59, 130, 246, 0.3);
+    transition: all 0.2s ease;
+}
+
+.ra-listen-btn:hover {
+    background: #2563eb;
+    transform: translateY(-1px);
+    box-shadow: 0 6px 14px rgba(59, 130, 246, 0.4);
+}
+
+.ra-soundout-btn {
+    background: #8b5cf6;
+    color: #ffffff;
+    border: none;
+    padding: 10px 20px;
+    font-size: 1rem;
+    font-weight: 700;
+    border-radius: 24px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    box-shadow: 0 4px 10px rgba(139, 92, 246, 0.3);
+    transition: all 0.2s ease;
+}
+
+.ra-soundout-btn:hover {
+    background: #7c3aed;
+    transform: translateY(-1px);
+    box-shadow: 0 6px 14px rgba(139, 92, 246, 0.4);
+}
+
+.ra-isolation-prompt {
+    font-size: 1.15rem;
+    color: #334155;
+    margin-top: 6px;
+    font-weight: 500;
+}
+
+.ra-coach-bubble {
+    background: #eff6ff;
+    border: 1px solid #93c5fd;
+    border-radius: 10px;
+    padding: 14px 20px;
+    margin-top: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    font-size: 1.2rem;
+    color: #1e40af;
+    animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.ra-inst-prev-line {
+    font-size: 1.1rem;
+    color: #64748b;
+    margin-bottom: 6px;
+}
+
+/* 3-Tier Word Highlights */
+.word-good {
+    color: #16a34a;
+    font-weight: 600;
+}
+
+.word-improvement {
+    color: #d97706;
+    background-color: #fef3c7;
+    border-radius: 3px;
+    padding: 2px 4px;
+}
+
+.word-miscue {
+    color: #dc2626;
+    background-color: #fee2e2;
+    border-radius: 3px;
+    padding: 2px 4px;
+    text-decoration: underline wavy #ef4444;
+}
+
+/* Questionnaire Unanswered Highlight */
+.ra-question-unanswered {
+    border: 2px solid #ef4444 !important;
+    background-color: #fff5f5 !important;
+    border-radius: 8px;
+    padding: 12px;
+    box-shadow: 0 0 8px rgba(239, 68, 68, 0.25);
+    transition: all 0.3s ease;
+}
+
+/* ==========================================================================
+   Analytics Dashboard & KPI Cards
+   ========================================================================== */
+.ra-teacher-banner {
+    background: linear-gradient(135deg, #1e293b, #334155);
+    color: #ffffff;
+    border-radius: 12px;
+    padding: 16px 24px;
+    margin-bottom: 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+    flex-wrap: wrap;
+    gap: 12px;
+}
+
+.ra-kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.ra-kpi-card {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 20px;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.04);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.ra-kpi-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.08);
+}
+
+.ra-kpi-icon {
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.3rem;
+    margin-bottom: 10px;
+}
+
+.ra-kpi-val {
+    font-size: 2rem;
+    font-weight: 800;
+    color: #0f172a;
+    line-height: 1.1;
+    margin-bottom: 4px;
+}
+
+.ra-kpi-label {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.ra-report-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 12px;
+    font-size: 0.95rem;
+}
+
+.ra-report-table th {
+    background: #f8fafc;
+    color: #475569;
+    font-weight: 700;
+    text-align: left;
+    padding: 12px 16px;
+    border-bottom: 2px solid #e2e8f0;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.ra-report-table td {
+    padding: 14px 16px;
+    border-bottom: 1px solid #f1f5f9;
+    color: #334155;
+    vertical-align: middle;
+}
+
+.ra-report-table tr:hover {
+    background-color: #f8fafc;
+}
+
+.ra-pill-badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 0.85rem;
+    font-weight: 700;
+}
+
+.ra-btn-detail {
+    background: #eff6ff;
+    color: #1d4ed8;
+    border: 1px solid #bfdbfe;
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.ra-btn-detail:hover {
+    background: #dbeafe;
+    border-color: #93c5fd;
+}
+
+.ra-detail-drawer {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 18px;
+    margin: 8px 0;
+    box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.02);
+}
+
+/* ========================================================= */
+/* NON-READER & EARLY PHONICS STUDIO STYLES                  */
+/* ========================================================= */
+
+.ra-nr-stage-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.ra-nr-badge {
+    background: #0284c7;
+    color: #ffffff;
+    font-weight: 700;
+    padding: 6px 16px;
+    border-radius: 9999px;
+    font-size: 0.95rem;
+    box-shadow: 0 2px 6px rgba(2, 132, 199, 0.25);
+}
+
+.ra-nr-progress {
+    font-weight: 700;
+    color: #64748b;
+    font-size: 1rem;
+}
+
+.ra-nr-card {
+    background: #ffffff;
+    border: 2px solid #e2e8f0;
+    border-radius: 18px;
+    padding: 32px 24px;
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.05);
+    text-align: center;
+}
+
+.ra-nr-prompt {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: #1e293b;
+    margin-bottom: 24px;
+}
+
+.ra-nr-letter-tile {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 180px;
+    height: 180px;
+    background: linear-gradient(135deg, #f0fdf4, #dcfce7);
+    border: 4px solid #22c55e;
+    border-radius: 24px;
+    margin: 10px auto 20px;
+    cursor: pointer;
+    box-shadow: 0 12px 24px rgba(34, 197, 94, 0.2);
+    transition: all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.ra-nr-letter-tile:hover {
+    transform: scale(1.06);
+    box-shadow: 0 16px 30px rgba(34, 197, 94, 0.3);
+}
+
+.ra-nr-big-letter {
+    font-size: 5rem;
+    font-weight: 900;
+    line-height: 1;
+    color: #15803d;
+}
+
+.ra-nr-small-letter {
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: #16a34a;
+    margin-top: 2px;
+}
+
+.ra-nr-speaker-icon {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: #15803d;
+    background: #ffffff;
+    padding: 2px 10px;
+    border-radius: 9999px;
+    margin-top: 6px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+
+.tile-success {
+    animation: tileSuccessAnim 0.6s ease-in-out;
+    background: linear-gradient(135deg, #86efac, #4ade80) !important;
+    border-color: #15803d !important;
+    transform: scale(1.1) !important;
+}
+
+@keyframes tileSuccessAnim {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.15) rotate(3deg); }
+    100% { transform: scale(1.1); }
+}
+
+.tile-error {
+    animation: tileErrorAnim 0.4s ease-in-out;
+    border-color: #ef4444 !important;
+    background: #fee2e2 !important;
+}
+
+@keyframes tileErrorAnim {
+    0%, 100% { transform: translateX(0); }
+    20%, 60% { transform: translateX(-8px); }
+    40%, 80% { transform: translateX(8px); }
+}
+
+.ra-nr-picture-box {
+    margin-bottom: 24px;
+}
+
+.ra-nr-picture-img {
+    max-height: 220px;
+    max-width: 100%;
+    border-radius: 16px;
+    border: 3px solid #e2e8f0;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.08);
+    object-fit: cover;
+}
+
+.ra-nr-tiles-row {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+}
+
+/* Progressive Continuous Blending Chain Styling */
+.ra-blend-chain {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 14px;
+    margin: 20px 0 26px;
+    flex-wrap: wrap;
+}
+
+.ra-blend-chunk {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-width: 80px;
+    height: 90px;
+    padding: 6px 16px;
+    background: #ffffff;
+    border: 3px solid #cbd5e1;
+    border-radius: 16px;
+    box-shadow: 0 6px 14px rgba(0, 0, 0, 0.05);
+    transition: all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.ra-blend-chunk-done {
+    border-color: #22c55e;
+    background: #f0fdf4;
+    color: #15803d;
+}
+
+.ra-blend-chunk-focus {
+    border-color: #8b5cf6;
+    background: #f5f3ff;
+    color: #6d28d9;
+}
+
+.ra-blend-chunk-active {
+    border-color: #0284c7;
+    background: #f0f9ff;
+    color: #0369a1;
+    transform: scale(1.1);
+    box-shadow: 0 10px 22px rgba(2, 132, 199, 0.25);
+}
+
+.ra-blend-symbol {
+    font-size: 2.2rem;
+    font-weight: 900;
+    color: #64748b;
+}
+
+.ra-blend-text {
+    font-size: 2.2rem;
+    font-weight: 900;
+    line-height: 1.1;
+}
+
+.ra-blend-phoneme {
+    font-size: 0.85rem;
+    font-weight: 600;
+    opacity: 0.85;
+    margin-top: 2px;
+}
+
+.ra-blend-formula-banner {
+    background: #eff6ff;
+    border: 2px solid #bfdbfe;
+    color: #1e40af;
+    font-size: 1.35rem;
+    font-weight: 800;
+    padding: 10px 24px;
+    border-radius: 9999px;
+    display: inline-block;
+    margin-bottom: 12px;
+    box-shadow: 0 4px 10px rgba(59, 130, 246, 0.15);
+}
+
+.ra-blend-full-banner {
+    background: linear-gradient(135deg, #fef08a, #facc15);
+    color: #854d0e;
+    font-size: 1.6rem;
+    font-weight: 900;
+    padding: 18px 36px;
+    border-radius: 16px;
+    margin: 18px 0 24px;
+    display: inline-block;
+    box-shadow: 0 8px 24px rgba(250, 204, 21, 0.45);
+}
+
+.ra-nr-feedback-msg {
+    font-size: 1.15rem;
+    color: #475569;
+    min-height: 32px;
+    margin: 14px 0;
+}
+
+.ra-streaming-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: #f0fdf4;
+    border: 1px solid #bbf7d0;
+    padding: 5px 14px;
+    border-radius: 9999px;
+}
+
+.ra-vad-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #cbd5e1;
+    display: inline-block;
+}
+
+.ra-vad-dot-active {
+    background: #22c55e;
+    box-shadow: 0 0 10px rgba(34, 197, 94, 0.75);
+    animation: vadPulse 1.5s infinite;
+}
+
+.ra-vad-dot-muted {
+    background: #f59e0b;
+    box-shadow: 0 0 8px rgba(245, 158, 11, 0.6);
+    animation: none;
+}
+
+@keyframes vadPulse {
+    0% { transform: scale(0.95); opacity: 0.85; }
+    50% { transform: scale(1.25); opacity: 1; }
+    100% { transform: scale(0.95); opacity: 0.85; }
+}
+
+/* Teacher Access Bar */
+.ra-teacher-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #f8fafc;
+    border: 1px solid #cbd5e1;
+    border-radius: 10px;
+    padding: 12px 18px;
+    margin-bottom: 20px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+}
+
+.ra-teacher-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 700;
+    color: #1e293b;
+    font-size: 1rem;
+}
+
+.ra-teacher-btn {
+    background: #0284c7;
+    border: none;
+    border-radius: 8px;
+    padding: 8px 20px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    text-decoration: none;
+    color: #ffffff !important;
+    font-weight: 700;
+    transition: background-color 0.2s ease;
+}
+
+.ra-teacher-btn:hover {
+    background: #0369a1;
+}
+
+/* Quiz & Questions Styling */
+.ra-quiz-card {
+    margin-top: 24px;
+    border-left: 4px solid #3b82f6;
+}
+
+.ra-quiz-intro {
+    color: #64748b;
+    margin-bottom: 16px;
+    font-size: 0.95rem;
+}
+
+.ra-question-item {
+    padding: 18px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    margin-bottom: 16px;
+}
+
+.ra-question-title {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: #1e293b;
+    margin-bottom: 12px;
+}
+
+.ra-question-description {
+    border-radius: 8px;
+    padding: 12px 16px;
+    background: #e0f2fe;
+    border: 1px solid #bae6fd;
+    color: #0369a1;
+}
+
+.ra-q-desc-title {
+    font-weight: 700;
+    font-size: 1.05rem;
+    margin-bottom: 4px;
+}
+
+.ra-q-desc-text {
+    font-size: 0.95rem;
+    line-height: 1.5;
+}
+
+.ra-options-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.ra-options-inline {
+    display: flex;
+    gap: 16px;
+}
+
+.ra-option-label {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.ra-option-label:hover {
+    background: #f1f5f9;
+    border-color: #94a3b8;
+}
+
+.ra-option-label input[type="radio"] {
+    transform: scale(1.2);
+    accent-color: #2563eb;
+}
+
+.ra-tf-true span { font-weight: 600; color: #16a34a; }
+.ra-tf-false span { font-weight: 600; color: #dc2626; }
+
+.ra-matching-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.ra-matching-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    background: #ffffff;
+    padding: 10px 14px;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+}
+
+.ra-matching-q {
+    font-weight: 600;
+    color: #334155;
+    flex: 1;
+}
+
+.ra-matching-select {
+    padding: 6px 12px;
+    border-radius: 6px;
+    border: 1px solid #94a3b8;
+    flex: 1;
+}
+
+.ra-input-text {
+    width: 100%;
+    padding: 10px 14px;
+    border-radius: 8px;
+    border: 1px solid #cbd5e1;
+    font-size: 1rem;
+}
+
+.ra-textarea {
+    width: 100%;
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid #cbd5e1;
+    font-size: 0.95rem;
+}
+
+.ra-ordering-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.ra-ordering-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: #ffffff;
+    padding: 10px 14px;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+}
+
+.ra-ordering-select {
+    padding: 6px;
+    border-radius: 6px;
+    border: 1px solid #94a3b8;
+    font-weight: 700;
+}
+
+.ra-quiz-submit-container {
+    margin-top: 24px;
+    text-align: right;
+}
+
+/* Finish Line & Completed Words Container */
+.ra-finish-line-container {
+    margin-top: 20px;
+    padding: 16px;
+    background: #f8fafc;
+    border: 1px solid #cbd5e1;
+    border-radius: 10px;
+}
+
+.ra-finish-line-label {
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: #475569;
+    margin-bottom: 12px;
+}
+
+.ra-finish-chips-wrapper {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+}
+
+/* Finish Chips */
+.ra-finish-chip {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+    user-select: none;
+}
+
+.ra-finish-chip:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+}
+
+.ra-finish-chip-good {
+    background: #dcfce7;
+    color: #15803d;
+    border: 1px solid #86efac;
+}
+
+.ra-finish-chip-miscue {
+    background: #ffe4e6;
+    color: #be123c;
+    border: 1px solid #fca5a5;
+}
+
+/* Phoneme Tooltip (Hidden by default, shown on hover) */
+.ra-phoneme-tooltip {
+    visibility: hidden;
+    opacity: 0;
+    width: 230px;
+    background-color: #1e293b;
+    color: #f8fafc;
+    text-align: left;
+    border-radius: 8px;
+    padding: 10px 14px;
+    position: absolute;
+    z-index: 9999;
+    bottom: 125%;
+    left: 50%;
+    transform: translateX(-50%);
+    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.25);
+    transition: opacity 0.2s ease, visibility 0.2s ease;
+    pointer-events: none;
+    font-size: 0.82rem;
+    line-height: 1.4;
+    font-weight: normal;
+}
+
+.ra-phoneme-tooltip::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    margin-left: -6px;
+    border-width: 6px;
+    border-style: solid;
+    border-color: #1e293b transparent transparent transparent;
+}
+
+.ra-finish-chip:hover .ra-phoneme-tooltip {
+    visibility: visible;
+    opacity: 1;
+}
+
+.ra-tooltip-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid #334155;
+    padding-bottom: 6px;
+    margin-bottom: 6px;
+    font-size: 0.85rem;
+}
+
+.ra-tooltip-score {
+    background: #0284c7;
+    color: #ffffff;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 700;
+    font-size: 0.75rem;
+}
+
+.ra-tooltip-ipa {
+    color: #94a3b8;
+    margin-bottom: 6px;
+}
+
+.ra-tooltip-ipa code {
+    color: #38bdf8;
+    background: transparent;
+}
+
+.ra-tooltip-ph-breakdown {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 6px;
+}
+
+.ra-ph-chip {
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+
+.ra-ph-good {
+    background: #166534;
+    color: #dcfce7;
+}
+
+.ra-ph-miscue {
+    background: #991b1b;
+    color: #fee2e2;
+}
+
+.ra-tooltip-footer {
+    font-size: 0.75rem;
+    color: #cbd5e1;
+    border-top: 1px solid #334155;
+    padding-top: 4px;
+    margin-top: 4px;
+}
+
+.ra-thresh-green {
+    background: #16a34a !important;
+    color: #ffffff !important;
+}
+
+.ra-thresh-orange {
+    background: #ea580c !important;
+    color: #ffffff !important;
+}
+
+.ra-thresh-red {
+    background: #dc2626 !important;
+    color: #ffffff !important;
+}
+
+.ra-ph-warn {
+    background: #c2410c;
+    color: #ffedd5;
+}
+
+
+
